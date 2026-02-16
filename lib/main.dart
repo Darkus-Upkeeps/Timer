@@ -54,6 +54,7 @@ class WorkTimer {
   final String product;
   final bool isTotalActive;
   final bool isPartialActive;
+  final DateTime createdAt;
 
   WorkTimer({
     required this.id,
@@ -61,6 +62,7 @@ class WorkTimer {
     required this.product,
     required this.isTotalActive,
     required this.isPartialActive,
+    required this.createdAt,
   });
 
   factory WorkTimer.fromMap(Map<String, Object?> m) => WorkTimer(
@@ -69,6 +71,9 @@ class WorkTimer {
         product: m['product'] as String,
         isTotalActive: (m['is_total_active'] as int? ?? 0) == 1,
         isPartialActive: (m['is_partial_active'] as int? ?? 0) == 1,
+        createdAt: DateTime.fromMillisecondsSinceEpoch(
+          (m['created_at_ms'] as int?) ?? DateTime.now().millisecondsSinceEpoch,
+        ),
       );
 }
 
@@ -96,7 +101,7 @@ class DB {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 2,
+      version: 3,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE timers (
@@ -104,7 +109,8 @@ class DB {
             name TEXT NOT NULL,
             product TEXT NOT NULL,
             is_total_active INTEGER NOT NULL DEFAULT 0,
-            is_partial_active INTEGER NOT NULL DEFAULT 0
+            is_partial_active INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL
           );
         ''');
         await db.execute('''
@@ -165,6 +171,12 @@ class DB {
 
           await db.execute('UPDATE timers SET is_total_active = 0, is_partial_active = 0');
         }
+
+        if (oldVersion < 3) {
+          await db.execute('ALTER TABLE timers ADD COLUMN created_at_ms INTEGER');
+          final nowMs = DateTime.now().millisecondsSinceEpoch;
+          await db.execute('UPDATE timers SET created_at_ms = COALESCE(created_at_ms, $nowMs)');
+        }
       },
     );
     return _db!;
@@ -183,6 +195,7 @@ class DB {
       'product': product.trim(),
       'is_total_active': 0,
       'is_partial_active': 0,
+      'created_at_ms': DateTime.now().millisecondsSinceEpoch,
     });
   }
 
@@ -350,6 +363,13 @@ String fmt(Duration d) {
   return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
 }
 
+String fmtDate(DateTime dt) {
+  final y = dt.year.toString().padLeft(4, '0');
+  final m = dt.month.toString().padLeft(2, '0');
+  final d = dt.day.toString().padLeft(2, '0');
+  return '$y-$m-$d';
+}
+
 class TimerStats {
   final Duration partialToday;
   final Duration totalAllTime;
@@ -500,6 +520,7 @@ class _TimersScreenState extends State<TimersScreen> {
                         children: [
                           Text(t.name, style: Theme.of(context).textTheme.titleMedium),
                           Text('Product: ${t.product}'),
+                          Text('Created: ${fmtDate(t.createdAt)}'),
                           const SizedBox(height: 8),
                           Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
