@@ -52,20 +52,23 @@ class WorkTimer {
   final int id;
   final String name;
   final String product;
-  final bool isActive;
+  final bool isTotalActive;
+  final bool isPartialActive;
 
   WorkTimer({
     required this.id,
     required this.name,
     required this.product,
-    required this.isActive,
+    required this.isTotalActive,
+    required this.isPartialActive,
   });
 
   factory WorkTimer.fromMap(Map<String, Object?> m) => WorkTimer(
         id: m['id'] as int,
         name: m['name'] as String,
         product: m['product'] as String,
-        isActive: (m['is_active'] as int) == 1,
+        isTotalActive: (m['is_total_active'] as int? ?? 0) == 1,
+        isPartialActive: (m['is_partial_active'] as int? ?? 0) == 1,
       );
 }
 
@@ -93,18 +96,19 @@ class DB {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE timers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             product TEXT NOT NULL,
-            is_active INTEGER NOT NULL DEFAULT 0
+            is_total_active INTEGER NOT NULL DEFAULT 0,
+            is_partial_active INTEGER NOT NULL DEFAULT 0
           );
         ''');
         await db.execute('''
-          CREATE TABLE segments (
+          CREATE TABLE total_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timer_id INTEGER NOT NULL,
             start_at_ms INTEGER NOT NULL,
@@ -112,6 +116,55 @@ class DB {
             FOREIGN KEY(timer_id) REFERENCES timers(id) ON DELETE CASCADE
           );
         ''');
+        await db.execute('''
+          CREATE TABLE partial_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timer_id INTEGER NOT NULL,
+            start_at_ms INTEGER NOT NULL,
+            end_at_ms INTEGER,
+            FOREIGN KEY(timer_id) REFERENCES timers(id) ON DELETE CASCADE
+          );
+        ''');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('ALTER TABLE timers ADD COLUMN is_total_active INTEGER NOT NULL DEFAULT 0');
+          await db.execute('ALTER TABLE timers ADD COLUMN is_partial_active INTEGER NOT NULL DEFAULT 0');
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS total_sessions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timer_id INTEGER NOT NULL,
+              start_at_ms INTEGER NOT NULL,
+              end_at_ms INTEGER,
+              FOREIGN KEY(timer_id) REFERENCES timers(id) ON DELETE CASCADE
+            );
+          ''');
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS partial_segments (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timer_id INTEGER NOT NULL,
+              start_at_ms INTEGER NOT NULL,
+              end_at_ms INTEGER,
+              FOREIGN KEY(timer_id) REFERENCES timers(id) ON DELETE CASCADE
+            );
+          ''');
+
+          final oldSegs = await db.query('segments');
+          for (final s in oldSegs) {
+            await db.insert('total_sessions', {
+              'timer_id': s['timer_id'],
+              'start_at_ms': s['start_at_ms'],
+              'end_at_ms': s['end_at_ms'],
+            });
+            await db.insert('partial_segments', {
+              'timer_id': s['timer_id'],
+              'start_at_ms': s['start_at_ms'],
+              'end_at_ms': s['end_at_ms'],
+            });
+          }
+
+          await db.execute('UPDATE timers SET is_total_active = 0, is_partial_active = 0');
+        }
       },
     );
     return _db!;
@@ -128,35 +181,55 @@ class DB {
     return db.insert('timers', {
       'name': name.trim(),
       'product': product.trim(),
-      'is_active': 0,
+      'is_total_active': 0,
+      'is_partial_active': 0,
     });
   }
 
   static Future<void> deleteTimer(int id) async {
     final db = await database;
-    await db.delete('segments', where: 'timer_id = ?', whereArgs: [id]);
+    await db.delete('total_sessions', where: 'timer_id = ?', whereArgs: [id]);
+    await db.delete('partial_segments', where: 'timer_id = ?', whereArgs: [id]);
     await db.delete('timers', where: 'id = ?', whereArgs: [id]);
   }
 
-  static Future<void> startTimer(int timerId) async {
+  static Future<void> start(int timerId) async {
     final db = await database;
     final now = DateTime.now().millisecondsSinceEpoch;
-    await db.update('timers', {'is_active': 1}, where: 'id = ?', whereArgs: [timerId]);
-    await db.insert('segments', {
+
+    await db.update(
+      'timers',
+      {'is_total_active': 1, 'is_partial_active': 1},
+      where: 'id = ?',
+      whereArgs: [timerId],
+    );
+
+    await db.insert('total_sessions', {
+      'timer_id': timerId,
+      'start_at_ms': now,
+      'end_at_ms': null,
+    });
+
+    await db.insert('partial_segments', {
       'timer_id': timerId,
       'start_at_ms': now,
       'end_at_ms': null,
     });
   }
 
-  static Future<void> pauseTimer(int timerId) async {
+  static Future<void> pausePartial(int timerId) async {
     final db = await database;
     final now = DateTime.now().millisecondsSinceEpoch;
 
-    await db.update('timers', {'is_active': 0}, where: 'id = ?', whereArgs: [timerId]);
+    await db.update(
+      'timers',
+      {'is_partial_active': 0},
+      where: 'id = ?',
+      whereArgs: [timerId],
+    );
 
     final openSeg = await db.query(
-      'segments',
+      'partial_segments',
       where: 'timer_id = ? AND end_at_ms IS NULL',
       whereArgs: [timerId],
       orderBy: 'start_at_ms DESC',
@@ -165,7 +238,7 @@ class DB {
 
     if (openSeg.isNotEmpty) {
       await db.update(
-        'segments',
+        'partial_segments',
         {'end_at_ms': now},
         where: 'id = ?',
         whereArgs: [openSeg.first['id']],
@@ -173,10 +246,83 @@ class DB {
     }
   }
 
-  static Future<List<Segment>> getSegmentsForTimer(int timerId) async {
+  static Future<void> resumePartial(int timerId) async {
+    final db = await database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    await db.update(
+      'timers',
+      {'is_partial_active': 1},
+      where: 'id = ?',
+      whereArgs: [timerId],
+    );
+
+    await db.insert('partial_segments', {
+      'timer_id': timerId,
+      'start_at_ms': now,
+      'end_at_ms': null,
+    });
+  }
+
+  static Future<void> stop(int timerId) async {
+    final db = await database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    await db.update(
+      'timers',
+      {'is_total_active': 0, 'is_partial_active': 0},
+      where: 'id = ?',
+      whereArgs: [timerId],
+    );
+
+    final openPartial = await db.query(
+      'partial_segments',
+      where: 'timer_id = ? AND end_at_ms IS NULL',
+      whereArgs: [timerId],
+      orderBy: 'start_at_ms DESC',
+      limit: 1,
+    );
+    if (openPartial.isNotEmpty) {
+      await db.update(
+        'partial_segments',
+        {'end_at_ms': now},
+        where: 'id = ?',
+        whereArgs: [openPartial.first['id']],
+      );
+    }
+
+    final openTotal = await db.query(
+      'total_sessions',
+      where: 'timer_id = ? AND end_at_ms IS NULL',
+      whereArgs: [timerId],
+      orderBy: 'start_at_ms DESC',
+      limit: 1,
+    );
+    if (openTotal.isNotEmpty) {
+      await db.update(
+        'total_sessions',
+        {'end_at_ms': now},
+        where: 'id = ?',
+        whereArgs: [openTotal.first['id']],
+      );
+    }
+  }
+
+  static Future<List<Segment>> getPartialSegmentsForTimer(int timerId) async {
     final db = await database;
     final rows = await db.query(
-      'segments',
+      'partial_segments',
+      where: 'timer_id = ?',
+      whereArgs: [timerId],
+      orderBy: 'start_at_ms ASC',
+    );
+    return rows.map(Segment.fromMap).toList();
+  }
+
+  static Future<List<Segment>> getTotalSessionsForTimer(int timerId) async {
+    final db = await database;
+    final rows = await db.query(
+      'total_sessions',
       where: 'timer_id = ?',
       whereArgs: [timerId],
       orderBy: 'start_at_ms ASC',
@@ -205,31 +351,40 @@ String fmt(Duration d) {
 }
 
 class TimerStats {
-  final Duration today;
-  final Duration total;
+  final Duration partialToday;
+  final Duration totalAllTime;
 
-  const TimerStats({required this.today, required this.total});
+  const TimerStats({required this.partialToday, required this.totalAllTime});
 }
 
 Future<TimerStats> computeStats(WorkTimer timer) async {
-  final segs = await DB.getSegmentsForTimer(timer.id);
+  final partialSegs = await DB.getPartialSegmentsForTimer(timer.id);
+  final totalSegs = await DB.getTotalSessionsForTimer(timer.id);
+
   final now = DateTime.now();
   final dayStart = DateTime(now.year, now.month, now.day);
-  Duration today = Duration.zero;
-  Duration total = Duration.zero;
 
-  for (final s in segs) {
+  Duration partialToday = Duration.zero;
+  Duration totalAllTime = Duration.zero;
+
+  for (final s in partialSegs) {
     final end = s.endAt ?? now;
     if (!end.isAfter(s.startAt)) continue;
-    total += end.difference(s.startAt);
-    today += overlapDuration(
+    partialToday += overlapDuration(
       rangeStart: dayStart,
       rangeEnd: now,
       segStart: s.startAt,
       segEnd: end,
     );
   }
-  return TimerStats(today: today, total: total);
+
+  for (final s in totalSegs) {
+    final end = s.endAt ?? now;
+    if (!end.isAfter(s.startAt)) continue;
+    totalAllTime += end.difference(s.startAt);
+  }
+
+  return TimerStats(partialToday: partialToday, totalAllTime: totalAllTime);
 }
 
 class TimersScreen extends StatefulWidget {
@@ -290,11 +445,13 @@ class _TimersScreenState extends State<TimersScreen> {
     );
   }
 
-  Future<void> _toggle(WorkTimer t) async {
-    if (t.isActive) {
-      await DB.pauseTimer(t.id);
+  Future<void> _primaryAction(WorkTimer t) async {
+    if (!t.isTotalActive) {
+      await DB.start(t.id);
+    } else if (t.isPartialActive) {
+      await DB.pausePartial(t.id);
     } else {
-      await DB.startTimer(t.id);
+      await DB.resumePartial(t.id);
     }
     setState(() {});
   }
@@ -302,9 +459,7 @@ class _TimersScreenState extends State<TimersScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Work Timers'),
-      ),
+      appBar: AppBar(title: const Text('Work Timers')),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _addTimerDialog,
         icon: const Icon(Icons.add),
@@ -330,8 +485,15 @@ class _TimersScreenState extends State<TimersScreen> {
                   child: FutureBuilder<TimerStats>(
                     future: computeStats(t),
                     builder: (context, statsSnap) {
-                      final today = statsSnap.data?.today ?? Duration.zero;
-                      final total = statsSnap.data?.total ?? Duration.zero;
+                      final partial = statsSnap.data?.partialToday ?? Duration.zero;
+                      final total = statsSnap.data?.totalAllTime ?? Duration.zero;
+
+                      final primaryLabel = !t.isTotalActive
+                          ? 'Start'
+                          : (t.isPartialActive ? 'Pause' : 'Resume');
+                      final primaryIcon = !t.isTotalActive
+                          ? Icons.play_arrow
+                          : (t.isPartialActive ? Icons.pause : Icons.play_arrow);
 
                       return Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -339,20 +501,31 @@ class _TimersScreenState extends State<TimersScreen> {
                           Text(t.name, style: Theme.of(context).textTheme.titleMedium),
                           Text('Product: ${t.product}'),
                           const SizedBox(height: 8),
-                          Text('Partial (today): ${fmt(today)}'),
+                          Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
                           const SizedBox(height: 10),
                           Row(
                             children: [
                               FilledButton.icon(
-                                onPressed: () => _toggle(t),
-                                icon: Icon(t.isActive ? Icons.pause : Icons.play_arrow),
-                                label: Text(t.isActive ? 'Pause' : 'Start'),
+                                onPressed: () => _primaryAction(t),
+                                icon: Icon(primaryIcon),
+                                label: Text(primaryLabel),
+                              ),
+                              const SizedBox(width: 8),
+                              OutlinedButton.icon(
+                                onPressed: t.isTotalActive
+                                    ? () async {
+                                        await DB.stop(t.id);
+                                        setState(() {});
+                                      }
+                                    : null,
+                                icon: const Icon(Icons.stop),
+                                label: const Text('Stop'),
                               ),
                               const SizedBox(width: 8),
                               TextButton.icon(
                                 onPressed: () async {
-                                  await DB.pauseTimer(t.id);
+                                  await DB.stop(t.id);
                                   await DB.deleteTimer(t.id);
                                   setState(() {});
                                 },
@@ -360,10 +533,14 @@ class _TimersScreenState extends State<TimersScreen> {
                                 label: const Text('Delete'),
                               ),
                               const Spacer(),
-                              if (t.isActive)
-                                const Chip(
-                                  label: Text('Running'),
-                                  avatar: Icon(Icons.circle, size: 10, color: Colors.green),
+                              if (t.isTotalActive)
+                                Chip(
+                                  label: Text(t.isPartialActive ? 'Running' : 'Paused (partial)'),
+                                  avatar: Icon(
+                                    Icons.circle,
+                                    size: 10,
+                                    color: t.isPartialActive ? Colors.green : Colors.orange,
+                                  ),
                                 ),
                             ],
                           ),
@@ -411,7 +588,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
     final map = <String, Duration>{};
 
     for (final t in timers) {
-      final segs = await DB.getSegmentsForTimer(t.id);
+      final segs = await DB.getTotalSessionsForTimer(t.id);
       Duration sum = Duration.zero;
       for (final s in segs) {
         final segEnd = s.endAt ?? DateTime.now();
@@ -431,7 +608,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Reports'),
+        title: const Text('Reports (Total Time)'),
         actions: [
           DropdownButton<String>(
             value: period,
