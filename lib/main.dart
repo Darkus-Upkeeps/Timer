@@ -504,14 +504,16 @@ class _TimersScreenState extends State<TimersScreen> {
                           Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
                           const SizedBox(height: 10),
-                          Row(
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            crossAxisAlignment: WrapCrossAlignment.center,
                             children: [
                               FilledButton.icon(
                                 onPressed: () => _primaryAction(t),
                                 icon: Icon(primaryIcon),
                                 label: Text(primaryLabel),
                               ),
-                              const SizedBox(width: 8),
                               OutlinedButton.icon(
                                 onPressed: t.isTotalActive
                                     ? () async {
@@ -522,7 +524,6 @@ class _TimersScreenState extends State<TimersScreen> {
                                 icon: const Icon(Icons.stop),
                                 label: const Text('Stop'),
                               ),
-                              const SizedBox(width: 8),
                               TextButton.icon(
                                 onPressed: () async {
                                   await DB.stop(t.id);
@@ -532,7 +533,6 @@ class _TimersScreenState extends State<TimersScreen> {
                                 icon: const Icon(Icons.delete_outline),
                                 label: const Text('Delete'),
                               ),
-                              const Spacer(),
                               if (t.isTotalActive)
                                 Chip(
                                   label: Text(t.isPartialActive ? 'Running' : 'Paused (partial)'),
