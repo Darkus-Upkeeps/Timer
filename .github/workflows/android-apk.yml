@@ -92,8 +92,26 @@ jobs:
       - name: Build APK
         run: flutter build apk --release
 
+      - name: Re-sign APK with stable keystore
+        run: |
+          APK_IN=build/app/outputs/flutter-apk/app-release.apk
+          APK_OUT=build/app/outputs/flutter-apk/app-release-signed.apk
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -n1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner not found" >&2
+            exit 1
+          fi
+          "$APKSIGNER" sign \
+            --ks android/app/upload-keystore.jks \
+            --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            --ks-pass "pass:${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            --key-pass "pass:${{ secrets.ANDROID_KEY_PASSWORD }}" \
+            --out "$APK_OUT" \
+            "$APK_IN"
+          "$APKSIGNER" verify --print-certs "$APK_OUT"
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: work-timer-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: build/app/outputs/flutter-apk/app-release-signed.apk
