@@ -27,6 +27,65 @@ jobs:
       - name: Create Flutter project scaffold (if missing)
         run: flutter create --platforms=android --project-name work_timer .
 
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/upload-keystore.jks
+
+      - name: Create key.properties
+        run: |
+          cat > android/key.properties <<EOF
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          storeFile=upload-keystore.jks
+          EOF
+
+      - name: Configure Android signing
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          kts = Path('android/app/build.gradle.kts')
+          groovy = Path('android/app/build.gradle')
+
+          if kts.exists():
+              s = kts.read_text()
+              if 'keyPropertiesFile' not in s:
+                  s = s.replace(
+                      'import java.util.Properties\n\nplugins {',
+                      'import java.util.Properties\n\nval keyPropertiesFile = rootProject.file("key.properties")\nval keyProperties = Properties()\nif (keyPropertiesFile.exists()) {\n    keyProperties.load(keyPropertiesFile.inputStream())\n}\n\nplugins {'
+                  )
+              if 'create("release")' not in s:
+                  s = s.replace(
+                      'signingConfigs {\n        create("debug") {\n            storeFile = file("debug.keystore")\n            storePassword = "android"\n            keyAlias = "androiddebugkey"\n            keyPassword = "android"\n        }\n    }',
+                      'signingConfigs {\n        create("debug") {\n            storeFile = file("debug.keystore")\n            storePassword = "android"\n            keyAlias = "androiddebugkey"\n            keyPassword = "android"\n        }\n        create("release") {\n            storeFile = file(keyProperties["storeFile"] as String)\n            storePassword = keyProperties["storePassword"] as String\n            keyAlias = keyProperties["keyAlias"] as String\n            keyPassword = keyProperties["keyPassword"] as String\n        }\n    }'
+                  )
+              s = s.replace(
+                  'getByName("release") {\n            signingConfig = signingConfigs.getByName("debug")',
+                  'getByName("release") {\n            signingConfig = signingConfigs.getByName("release")'
+              )
+              kts.write_text(s)
+          elif groovy.exists():
+              s = groovy.read_text()
+              if 'keyPropertiesFile' not in s:
+                  s = s.replace(
+                      'def localProperties = new Properties()',
+                      'def keystoreProperties = new Properties()\ndef keystorePropertiesFile = rootProject.file(\'key.properties\')\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n}\n\ndef localProperties = new Properties()'
+                  )
+              if 'signingConfigs {' in s and 'release {' not in s.split('signingConfigs {',1)[1].split('}',1)[0]:
+                  s = s.replace(
+                      'buildTypes {',
+                      'signingConfigs {\n        release {\n            keyAlias keystoreProperties[\'keyAlias\']\n            keyPassword keystoreProperties[\'keyPassword\']\n            storeFile keystoreProperties[\'storeFile\'] ? file(keystoreProperties[\'storeFile\']) : null\n            storePassword keystoreProperties[\'storePassword\']\n        }\n    }\n\n    buildTypes {'
+                  )
+              s = s.replace(
+                  'release {\n            // TODO: Add your own signing config for the release build.\n            // Signing with the debug keys for now, so `flutter run --release` works.\n            signingConfig signingConfigs.debug',
+                  'release {\n            signingConfig signingConfigs.release'
+              )
+              groovy.write_text(s)
+          else:
+              raise SystemExit('No Android Gradle file found')
+          PY
+
       - name: Pub get
         run: flutter pub get
 
