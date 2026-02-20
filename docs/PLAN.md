@@ -1,65 +1,45 @@
-# PLAN.md — Private One-Tap Updater (Stable/Beta)
+# PLAN.md — Restore Core Timer Features (Multi-Timer + Reports) while keeping Updater
 
 ## Root Cause
-Current repository has CI that builds signed APK artifacts, but the app itself has no in-app update flow. Updating requires manual GitHub navigation, download, and install.
+During updater integration/recovery, `lib/main.dart` was replaced with a simplified single-timer UI to stabilize release/signing and OTA updates. That removed prior core product capabilities.
 
-## Goal
-Enable a one-tap **Update App** flow inside the app for single-user private distribution, with channel support:
-- **Stable** → `main`
-- **Beta** → `Timer-Working`
+## Features to Restore
+1. **Multiple spawnable timers**
+   - Create/edit/delete timers
+   - Independent elapsed tracking per timer
+   - Start/stop per timer
+2. **Report feature**
+   - Restore report generation/export path from prior app behavior
+   - Include per-timer totals and date range aggregation
+3. **Keep new updater system intact**
+   - Stable-only update lane (`main` + `latest-stable`)
+   - PAT-secured private release fetch
 
-## Constraints
-- Repo is private.
-- Distribution target is Markus only.
-- APK must remain signed with the same release key.
+## Implementation Plan
+1. **Reconstruct data model + persistence**
+   - Add `timers` table and `time_entries` (or equivalent) for multi-timer records.
+   - Migrate/initialize DB safely.
+2. **Rebuild timer management UI**
+   - Timer list view
+   - Add timer dialog
+   - Edit/delete actions
+   - Per-item controls and running-state UI
+3. **Restore reporting**
+   - Daily/period summaries
+   - Report screen + export/share action
+4. **Preserve updater panel**
+   - Keep App Updates card with token save/check/install
+5. **Validation**
+   - Functional test: create multiple timers, run concurrently/sequentially, verify totals
+   - Report test: totals match tracked entries
+   - Updater test: still checks `latest-stable`
 
-## Architecture
-1. **Build/Publish lane (GitHub Actions)**
-   - Keep signed APK build job.
-   - Add workflow output metadata (`versionName`, `versionCode`, `channel`, `commit`, `timestamp`).
-   - Upload APK + `update.json` artifact.
+## Risk/Tradeoffs
+- Reconstructing features from memory may differ from original UX if legacy source isn’t available.
+- Fastest high-confidence path is to recover from previous commits/files where these features existed, then merge updater panel in.
 
-2. **Private update manifest endpoint**
-   - Lightweight endpoint returns latest per channel:
-     - `versionCode`
-     - `versionName`
-     - `channel`
-     - `apkUrl`
-     - `sha256`
-     - `notes`
-   - App reads this endpoint.
-
-3. **In-app updater UI/logic**
-   - Add settings/update panel with:
-     - Channel selector: Stable/Beta
-     - Button: Check for update
-     - Button: Install latest
-   - Compare remote `versionCode` with local app version.
-   - Download APK to app storage.
-   - Trigger Android package installer intent.
-
-4. **Android permissions/security**
-   - Handle unknown sources / package install permission path.
-   - Verify SHA256 before install.
-   - Require HTTPS for manifest/APK URL.
-
-## Implementation Steps
-1. Add/update dependencies for package info + download + installer launch.
-2. Implement updater service in Dart (manifest fetch, compare, download, checksum).
-3. Add update UI with channel toggle and progress/errors.
-4. Extend CI workflow to emit `update.json` and channel-aware outputs.
-5. Validate on-device install flow for both channels.
-
-## Verification
-1. Push commit to `main` and `Timer-Working`.
-2. Confirm CI artifacts contain signed APK + manifest.
-3. In app on Stable channel:
-   - Check shows newer version after `main` push.
-   - Install succeeds.
-4. Switch to Beta channel:
-   - Check resolves `Timer-Working` build.
-   - Install succeeds.
-5. Downgrade prevention / same-version no-op works cleanly.
-
-## Notes
-Current `lib/main.dart` snapshot appears incomplete/non-buildable. If confirmed, first step is to restore a compilable Flutter baseline before wiring updater components.
+## Deliverables
+- Restored multi-timer production flow
+- Restored report feature
+- Updater still operational
+- Updated README with user flow
