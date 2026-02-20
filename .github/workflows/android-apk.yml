@@ -32,7 +32,21 @@ jobs:
 
       - name: Decode keystore
         run: |
-          printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/upload-keystore.jks
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "ANDROID_KEYSTORE_BASE64 is missing" >&2
+            exit 1
+          fi
+
+          # Normalize accidental whitespace/newlines from pasted secrets.
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" \
+            | tr -d '\r\n\t ' \
+            | base64 -d > android/app/upload-keystore.jks
+
+          if [ ! -s android/app/upload-keystore.jks ]; then
+            echo "Decoded keystore is empty (invalid base64 secret)." >&2
+            exit 1
+          fi
+
           keytool -list -keystore android/app/upload-keystore.jks -storepass "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >/dev/null
 
       - name: Create key.properties
