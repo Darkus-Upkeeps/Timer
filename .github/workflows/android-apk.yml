@@ -30,6 +30,19 @@ jobs:
       - name: Create Flutter project scaffold (if missing)
         run: flutter create --platforms=android --project-name work_timer .
 
+      - name: Ensure Android INTERNET permission
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          perm = '<uses-permission android:name="android.permission.INTERNET"/>'
+          if perm not in s:
+            s = s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+                          '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    ' + perm)
+            p.write_text(s)
+          PY
+
       - name: Decode keystore
         run: |
           if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
