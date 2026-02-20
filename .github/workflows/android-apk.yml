@@ -3,7 +3,10 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "Timer-Working"]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -30,7 +33,6 @@ jobs:
       - name: Decode keystore
         run: |
           printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/upload-keystore.jks
-          ls -lh android/app/upload-keystore.jks
           keytool -list -keystore android/app/upload-keystore.jks -storepass "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >/dev/null
 
       - name: Create key.properties
@@ -69,12 +71,12 @@ jobs:
               kts.write_text(s)
           elif groovy.exists():
               s = groovy.read_text()
-              if 'keyPropertiesFile' not in s:
+              if 'keystorePropertiesFile' not in s:
                   s = s.replace(
                       'def localProperties = new Properties()',
                       'def keystoreProperties = new Properties()\ndef keystorePropertiesFile = rootProject.file(\'key.properties\')\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n}\n\ndef localProperties = new Properties()'
                   )
-              if 'signingConfigs {' in s and 'release {' not in s.split('signingConfigs {',1)[1].split('}',1)[0]:
+              if 'signingConfigs {' in s and 'release {' not in s:
                   s = s.replace(
                       'buildTypes {',
                       'signingConfigs {\n        release {\n            keyAlias keystoreProperties[\'keyAlias\']\n            keyPassword keystoreProperties[\'keyPassword\']\n            storeFile keystoreProperties[\'storeFile\'] ? file(keystoreProperties[\'storeFile\']) : null\n            storePassword keystoreProperties[\'storePassword\']\n        }\n    }\n\n    buildTypes {'
@@ -99,10 +101,6 @@ jobs:
           APK_IN=build/app/outputs/flutter-apk/app-release.apk
           APK_OUT=build/app/outputs/flutter-apk/app-release-signed.apk
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -n1)
-          if [ -z "$APKSIGNER" ]; then
-            echo "apksigner not found" >&2
-            exit 1
-          fi
           "$APKSIGNER" sign \
             --ks android/app/upload-keystore.jks \
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
@@ -112,8 +110,53 @@ jobs:
             "$APK_IN"
           "$APKSIGNER" verify --print-certs "$APK_OUT"
 
-      - name: Upload APK artifact
+      - name: Prepare release metadata
+        id: prep
+        run: |
+          VERSION_LINE=$(grep '^version:' pubspec.yaml | head -n1 | awk '{print $2}')
+          VERSION_NAME=${VERSION_LINE%%+*}
+          VERSION_CODE=${VERSION_LINE##*+}
+          CHANNEL="stable"
+          TAG="latest-stable"
+          RELEASE_NAME="Stable ${VERSION_NAME} (${VERSION_CODE})"
+          PRERELEASE="false"
+          if [ "${GITHUB_REF_NAME}" = "Timer-Working" ]; then
+            CHANNEL="beta"
+            TAG="latest-beta"
+            RELEASE_NAME="Beta ${VERSION_NAME} (${VERSION_CODE})"
+            PRERELEASE="true"
+          fi
+
+          SHA=$(sha256sum build/app/outputs/flutter-apk/app-release-signed.apk | awk '{print $1}')
+          APK_NAME="work-timer-${CHANNEL}-${VERSION_CODE}.apk"
+          cp build/app/outputs/flutter-apk/app-release-signed.apk "$APK_NAME"
+
+          BODY=$(cat <<EOF
+          {"versionName":"${VERSION_NAME}","versionCode":${VERSION_CODE},"channel":"${CHANNEL}","sha256":"${SHA}","notes":"Build from ${GITHUB_SHA}"}
+          EOF
+          )
+
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "release_name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "prerelease=${PRERELEASE}" >> $GITHUB_OUTPUT
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+          echo "body=${BODY}" >> $GITHUB_OUTPUT
+
+      - name: Publish rolling release (channel latest)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.prep.outputs.tag }}
+          name: ${{ steps.prep.outputs.release_name }}
+          body: ${{ steps.prep.outputs.body }}
+          commit: ${{ github.sha }}
+          allowUpdates: true
+          removeArtifacts: true
+          replacesArtifacts: true
+          prerelease: ${{ steps.prep.outputs.prerelease }}
+          artifacts: ${{ steps.prep.outputs.apk_name }}
+
+      - name: Upload APK artifact (CI backup)
         uses: actions/upload-artifact@v4
         with:
-          name: work-timer-apk
-          path: build/app/outputs/flutter-apk/app-release-signed.apk
+          name: ${{ steps.prep.outputs.apk_name }}
+          path: ${{ steps.prep.outputs.apk_name }}
