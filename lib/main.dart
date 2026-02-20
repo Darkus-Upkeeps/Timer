@@ -48,7 +48,7 @@ class _TimerHomePageState extends State<TimerHomePage> {
   DateTime? _startedAt;
   Duration _elapsed = Duration.zero;
 
-  String _channel = 'stable';
+  final String _channel = 'stable';
   bool _updateBusy = false;
   String _updateStatus = 'Idle';
   UpdateManifest? _manifest;
@@ -123,7 +123,7 @@ class _TimerHomePageState extends State<TimerHomePage> {
     return '$h:$m:$s';
   }
 
-  String get _releaseTag => _channel == 'stable' ? 'latest-stable' : 'latest-beta';
+  String get _releaseTag => 'latest-stable';
 
   Map<String, String> _ghHeaders(String token) => {
         'Authorization': 'Bearer $token',
@@ -305,14 +305,7 @@ class _TimerHomePageState extends State<TimerHomePage> {
                     const SizedBox(height: 8),
                     OutlinedButton(onPressed: _saveToken, child: const Text('Save Token')),
                     const SizedBox(height: 12),
-                    SegmentedButton<String>(
-                      segments: const [
-                        ButtonSegment(value: 'stable', label: Text('Stable')),
-                        ButtonSegment(value: 'beta', label: Text('Beta')),
-                      ],
-                      selected: {_channel},
-                      onSelectionChanged: (s) => setState(() => _channel = s.first),
-                    ),
+                    const Text('Channel: Stable'),
                     const SizedBox(height: 12),
                     Wrap(
                       spacing: 8,

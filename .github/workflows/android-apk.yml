@@ -3,7 +3,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "Timer-Working"]
+    branches: ["main"]
 
 permissions:
   contents: write
@@ -147,12 +147,6 @@ jobs:
           TAG="latest-stable"
           RELEASE_NAME="Stable ${VERSION_NAME} (${VERSION_CODE})"
           PRERELEASE="false"
-          if [ "${GITHUB_REF_NAME}" = "Timer-Working" ]; then
-            CHANNEL="beta"
-            TAG="latest-beta"
-            RELEASE_NAME="Beta ${VERSION_NAME} (${VERSION_CODE})"
-            PRERELEASE="true"
-          fi
 
           SHA=$(sha256sum build/app/outputs/flutter-apk/app-release-signed.apk | awk '{print $1}')
           APK_NAME="work-timer-${CHANNEL}-${VERSION_CODE}.apk"
