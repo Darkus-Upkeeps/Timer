@@ -3,7 +3,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "Timer-Working"]
 
 jobs:
   build:
@@ -30,7 +30,6 @@ jobs:
       - name: Decode keystore
         run: |
           printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/upload-keystore.jks
-          ls -lh android/app/upload-keystore.jks
           keytool -list -keystore android/app/upload-keystore.jks -storepass "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >/dev/null
 
       - name: Create key.properties
@@ -69,12 +68,12 @@ jobs:
               kts.write_text(s)
           elif groovy.exists():
               s = groovy.read_text()
-              if 'keyPropertiesFile' not in s:
+              if 'keystorePropertiesFile' not in s:
                   s = s.replace(
                       'def localProperties = new Properties()',
                       'def keystoreProperties = new Properties()\ndef keystorePropertiesFile = rootProject.file(\'key.properties\')\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n}\n\ndef localProperties = new Properties()'
                   )
-              if 'signingConfigs {' in s and 'release {' not in s.split('signingConfigs {',1)[1].split('}',1)[0]:
+              if 'signingConfigs {' in s and 'release {' not in s:
                   s = s.replace(
                       'buildTypes {',
                       'signingConfigs {\n        release {\n            keyAlias keystoreProperties[\'keyAlias\']\n            keyPassword keystoreProperties[\'keyPassword\']\n            storeFile keystoreProperties[\'storeFile\'] ? file(keystoreProperties[\'storeFile\']) : null\n            storePassword keystoreProperties[\'storePassword\']\n        }\n    }\n\n    buildTypes {'
@@ -99,10 +98,6 @@ jobs:
           APK_IN=build/app/outputs/flutter-apk/app-release.apk
           APK_OUT=build/app/outputs/flutter-apk/app-release-signed.apk
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -n1)
-          if [ -z "$APKSIGNER" ]; then
-            echo "apksigner not found" >&2
-            exit 1
-          fi
           "$APKSIGNER" sign \
             --ks android/app/upload-keystore.jks \
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
@@ -112,8 +107,41 @@ jobs:
             "$APK_IN"
           "$APKSIGNER" verify --print-certs "$APK_OUT"
 
+      - name: Build update manifest
+        id: manifest
+        run: |
+          VERSION_LINE=$(grep '^version:' pubspec.yaml | head -n1 | awk '{print $2}')
+          VERSION_NAME=${VERSION_LINE%%+*}
+          VERSION_CODE=${VERSION_LINE##*+}
+          CHANNEL="stable"
+          if [ "${GITHUB_REF_NAME}" = "Timer-Working" ]; then CHANNEL="beta"; fi
+          SHA=$(sha256sum build/app/outputs/flutter-apk/app-release-signed.apk | awk '{print $1}')
+          APK_NAME="work-timer-${CHANNEL}-${VERSION_CODE}.apk"
+          cp build/app/outputs/flutter-apk/app-release-signed.apk "$APK_NAME"
+
+          mkdir -p update
+          cat > "update/${CHANNEL}.json" <<EOF
+          {
+            "versionName": "${VERSION_NAME}",
+            "versionCode": ${VERSION_CODE},
+            "channel": "${CHANNEL}",
+            "apkUrl": "REPLACE_WITH_PRIVATE_APK_URL",
+            "sha256": "${SHA}",
+            "notes": "Build from ${GITHUB_SHA}"
+          }
+          EOF
+
+          echo "channel=${CHANNEL}" >> $GITHUB_OUTPUT
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: work-timer-apk
-          path: build/app/outputs/flutter-apk/app-release-signed.apk
+          name: ${{ steps.manifest.outputs.apk_name }}
+          path: ${{ steps.manifest.outputs.apk_name }}
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-manifest-${{ steps.manifest.outputs.channel }}
+          path: update/${{ steps.manifest.outputs.channel }}.json
