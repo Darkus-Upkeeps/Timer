@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:open_filex/open_filex.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -37,6 +38,12 @@ class TimerHomePage extends StatefulWidget {
 }
 
 class _TimerHomePageState extends State<TimerHomePage> {
+  static const _storage = FlutterSecureStorage();
+  static const _tokenKey = 'github_pat';
+
+  static const _owner = 'Darkus-Upkeeps';
+  static const _repo = 'Timer';
+
   Timer? _ticker;
   DateTime? _startedAt;
   Duration _elapsed = Duration.zero;
@@ -47,26 +54,43 @@ class _TimerHomePageState extends State<TimerHomePage> {
   UpdateManifest? _manifest;
   int _localVersionCode = 0;
 
-  static const String _stableManifestUrl =
-      'https://raw.githubusercontent.com/Darkus-Upkeeps/Timer/main/update/stable.json';
-  static const String _betaManifestUrl =
-      'https://raw.githubusercontent.com/Darkus-Upkeeps/Timer/main/update/beta.json';
+  final _tokenController = TextEditingController();
+  bool _hideToken = true;
 
   @override
   void initState() {
     super.initState();
     _loadLocalVersion();
+    _loadToken();
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _tokenController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadToken() async {
+    final token = await _storage.read(key: _tokenKey) ?? '';
+    if (!mounted) return;
+    setState(() {
+      _tokenController.text = token;
+    });
+  }
+
+  Future<void> _saveToken() async {
+    await _storage.write(key: _tokenKey, value: _tokenController.text.trim());
+    if (!mounted) return;
+    setState(() {
+      _updateStatus = 'GitHub token saved securely.';
+    });
   }
 
   Future<void> _loadLocalVersion() async {
     final info = await PackageInfo.fromPlatform();
     final vc = int.tryParse(info.buildNumber) ?? 0;
+    if (!mounted) return;
     setState(() {
       _localVersionCode = vc;
     });
@@ -99,23 +123,57 @@ class _TimerHomePageState extends State<TimerHomePage> {
     return '$h:$m:$s';
   }
 
-  String get _manifestUrl =>
-      _channel == 'stable' ? _stableManifestUrl : _betaManifestUrl;
+  String get _releaseTag => _channel == 'stable' ? 'latest-stable' : 'latest-beta';
+
+  Map<String, String> _ghHeaders(String token) => {
+        'Authorization': 'Bearer $token',
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      };
 
   Future<void> _checkUpdate() async {
+    final token = _tokenController.text.trim();
+    if (token.isEmpty) {
+      setState(() => _updateStatus = 'Please enter GitHub token first.');
+      return;
+    }
+
     setState(() {
       _updateBusy = true;
-      _updateStatus = 'Checking $_channel channel...';
+      _updateStatus = 'Checking $_channel release...';
     });
 
     try {
-      final res = await http.get(Uri.parse(_manifestUrl));
+      final url = Uri.parse(
+        'https://api.github.com/repos/$_owner/$_repo/releases/tags/$_releaseTag',
+      );
+      final res = await http.get(url, headers: _ghHeaders(token));
       if (res.statusCode != 200) {
-        throw Exception('Manifest fetch failed (${res.statusCode})');
+        throw Exception('Release fetch failed (${res.statusCode}): ${res.body}');
       }
 
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      final m = UpdateManifest.fromJson(data);
+      final release = jsonDecode(res.body) as Map<String, dynamic>;
+      final assets = (release['assets'] as List<dynamic>? ?? const [])
+          .cast<Map<String, dynamic>>();
+      final apkAsset = assets.firstWhere(
+        (a) => (a['name'] as String? ?? '').endsWith('.apk'),
+        orElse: () => <String, dynamic>{},
+      );
+      if (apkAsset.isEmpty) throw Exception('No APK asset found in release.');
+
+      final bodyRaw = (release['body'] as String? ?? '{}').trim();
+      final meta = (jsonDecode(bodyRaw) as Map<String, dynamic>);
+
+      final m = UpdateManifest(
+        versionCode: (meta['versionCode'] as num?)?.toInt() ?? 0,
+        versionName: (meta['versionName'] as String?) ?? '0.0.0',
+        channel: (meta['channel'] as String?) ?? _channel,
+        sha256: (meta['sha256'] as String?) ?? '',
+        notes: (meta['notes'] as String?) ?? '',
+        apkApiUrl: (apkAsset['url'] as String?) ?? '',
+        apkFileName: (apkAsset['name'] as String?) ?? 'work-timer.apk',
+      );
+
       setState(() {
         _manifest = m;
         _updateStatus = m.versionCode > _localVersionCode
@@ -135,7 +193,12 @@ class _TimerHomePageState extends State<TimerHomePage> {
   }
 
   Future<void> _installLatest() async {
+    final token = _tokenController.text.trim();
     final m = _manifest;
+    if (token.isEmpty) {
+      setState(() => _updateStatus = 'Missing GitHub token.');
+      return;
+    }
     if (m == null) {
       setState(() => _updateStatus = 'Run update check first.');
       return;
@@ -152,9 +215,14 @@ class _TimerHomePageState extends State<TimerHomePage> {
 
     try {
       final dir = await getApplicationDocumentsDirectory();
-      final out = File('${dir.path}/work-timer-${m.channel}-${m.versionCode}.apk');
+      final out = File('${dir.path}/${m.apkFileName}');
 
-      final req = await HttpClient().getUrl(Uri.parse(m.apkUrl));
+      final client = HttpClient();
+      final req = await client.getUrl(Uri.parse(m.apkApiUrl));
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set(HttpHeaders.acceptHeader, 'application/octet-stream');
+      req.headers.set('X-GitHub-Api-Version', '2022-11-28');
+
       final resp = await req.close();
       if (resp.statusCode != 200) {
         throw Exception('APK download failed (${resp.statusCode})');
@@ -168,7 +236,10 @@ class _TimerHomePageState extends State<TimerHomePage> {
       }
 
       setState(() => _updateStatus = 'Launching installer...');
-      final result = await OpenFilex.open(out.path, type: 'application/vnd.android.package-archive');
+      final result = await OpenFilex.open(
+        out.path,
+        type: 'application/vnd.android.package-archive',
+      );
       setState(() => _updateStatus = 'Installer result: ${result.message}');
     } catch (e) {
       setState(() => _updateStatus = 'Install failed: $e');
@@ -188,8 +259,7 @@ class _TimerHomePageState extends State<TimerHomePage> {
       appBar: AppBar(title: const Text('Work Timer')),
       body: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+        child: ListView(
           children: [
             Card(
               child: Padding(
@@ -220,7 +290,21 @@ class _TimerHomePageState extends State<TimerHomePage> {
                     Text('App Updates', style: Theme.of(context).textTheme.titleLarge),
                     const SizedBox(height: 8),
                     Text('Local versionCode: $_localVersionCode'),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _tokenController,
+                      obscureText: _hideToken,
+                      decoration: InputDecoration(
+                        labelText: 'GitHub PAT (repo read)',
+                        suffixIcon: IconButton(
+                          onPressed: () => setState(() => _hideToken = !_hideToken),
+                          icon: Icon(_hideToken ? Icons.visibility : Icons.visibility_off),
+                        ),
+                      ),
+                    ),
                     const SizedBox(height: 8),
+                    OutlinedButton(onPressed: _saveToken, child: const Text('Save Token')),
+                    const SizedBox(height: 12),
                     SegmentedButton<String>(
                       segments: const [
                         ButtonSegment(value: 'stable', label: Text('Stable')),
@@ -248,6 +332,7 @@ class _TimerHomePageState extends State<TimerHomePage> {
                     if (_manifest != null) ...[
                       const SizedBox(height: 8),
                       Text('Remote: ${_manifest!.versionName} (${_manifest!.versionCode})'),
+                      Text('Notes: ${_manifest!.notes}'),
                     ],
                   ],
                 ),
@@ -265,26 +350,17 @@ class UpdateManifest {
     required this.versionCode,
     required this.versionName,
     required this.channel,
-    required this.apkUrl,
     required this.sha256,
     required this.notes,
+    required this.apkApiUrl,
+    required this.apkFileName,
   });
 
   final int versionCode;
   final String versionName;
   final String channel;
-  final String apkUrl;
   final String sha256;
   final String notes;
-
-  factory UpdateManifest.fromJson(Map<String, dynamic> json) {
-    return UpdateManifest(
-      versionCode: (json['versionCode'] as num?)?.toInt() ?? 0,
-      versionName: (json['versionName'] as String?) ?? '0.0.0',
-      channel: (json['channel'] as String?) ?? 'stable',
-      apkUrl: (json['apkUrl'] as String?) ?? '',
-      sha256: (json['sha256'] as String?) ?? '',
-      notes: (json['notes'] as String?) ?? '',
-    );
-  }
+  final String apkApiUrl;
+  final String apkFileName;
 }
