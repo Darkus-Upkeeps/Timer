@@ -862,7 +862,6 @@ class _ReportsScreenState extends State<ReportsScreen> {
       }
       final keys = grouped.keys.toList()..sort((a, b) => a.compareTo(b));
 
-      final weekSummary = <List<String>>[];
       for (final wk in keys) {
         final block = grouped[wk]!;
         final weekTotal = block.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
@@ -887,18 +886,8 @@ class _ReportsScreenState extends State<ReportsScreen> {
         );
         widgets.add(pw.SizedBox(height: 4));
         widgets.add(pw.Text('Wochensumme: ${fmt(weekTotal)}'));
-        weekSummary.add(['KW $kw', fmt(weekTotal)]);
         widgets.add(pw.SizedBox(height: 12));
       }
-
-      widgets.add(pw.Text('Wochenübersicht', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)));
-      widgets.add(
-        pw.Table.fromTextArray(
-          headers: const ['Kalenderwoche', 'Summe'],
-          data: weekSummary,
-        ),
-      );
-      widgets.add(pw.SizedBox(height: 12));
     } else {
       widgets.add(
         pw.Table.fromTextArray(
