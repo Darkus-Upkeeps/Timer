@@ -1,45 +1,43 @@
-# PLAN.md — Restore Core Timer Features (Multi-Timer + Reports) while keeping Updater
+# PLAN.md — Edit-All Values + Datestamp Restore
 
 ## Root Cause
-During updater integration/recovery, `lib/main.dart` was replaced with a simplified single-timer UI to stabilize release/signing and OTA updates. That removed prior core product capabilities.
+Current restored UI supports editing timer metadata (name/product) but does not expose correction controls for recorded time values (partial/total). Datestamp display from earlier commits was also dropped during refactors.
 
-## Features to Restore
-1. **Multiple spawnable timers**
-   - Create/edit/delete timers
-   - Independent elapsed tracking per timer
-   - Start/stop per timer
-2. **Report feature**
-   - Restore report generation/export path from prior app behavior
-   - Include per-timer totals and date range aggregation
-3. **Keep new updater system intact**
-   - Stable-only update lane (`main` + `latest-stable`)
-   - PAT-secured private release fetch
+## Target Behavior
+1. **Edit function can adjust all relevant values**
+   - Name
+   - Product
+   - Partial time (today correction)
+   - Total time (all-time correction)
+2. **Datestamp is visible again**
+   - Show timer created date on timer cards
+   - Preserve existing data for older timers (fallback when missing)
+3. **Printable PDF report export**
+   - Generate Zeitanachweis-style PDF
+   - Include timer name, product, date, start, end, pause, duration, totals
+   - Include signature section (Signatur line)
 
 ## Implementation Plan
-1. **Reconstruct data model + persistence**
-   - Add `timers` table and `time_entries` (or equivalent) for multi-timer records.
-   - Migrate/initialize DB safely.
-2. **Rebuild timer management UI**
-   - Timer list view
-   - Add timer dialog
-   - Edit/delete actions
-   - Per-item controls and running-state UI
-3. **Restore reporting**
-   - Daily/period summaries
-   - Report screen + export/share action
-4. **Preserve updater panel**
-   - Keep App Updates card with token save/check/install
-5. **Validation**
-   - Functional test: create multiple timers, run concurrently/sequentially, verify totals
-   - Report test: totals match tracked entries
-   - Updater test: still checks `latest-stable`
+1. **Schema update (safe migration)**
+   - Add `created_at_ms` to `timers` (default now for new rows, backfill old rows).
+2. **Time correction model**
+   - Add correction columns on `timers`:
+     - `partial_adjust_sec` (default 0)
+     - `total_adjust_sec` (default 0)
+   - Keep raw sessions/segments immutable; apply correction at read time.
+3. **Edit dialog upgrade**
+   - Add inputs for partial and total correction (seconds/minutes UX).
+   - Validate no invalid numbers.
+4. **Computation updates**
+   - Timer cards: displayed Partial/Total = computed base + adjustment.
+   - Reports: include partial adjustments where relevant.
+5. **Datestamp UI**
+   - Render `Created: YYYY-MM-DD HH:mm` on timer cards.
+6. **Verification**
+   - Create timer -> datestamp shows.
+   - Edit name/product/time corrections -> values update instantly.
+   - Report reflects adjusted partial values.
+   - Updater flow remains unchanged.
 
-## Risk/Tradeoffs
-- Reconstructing features from memory may differ from original UX if legacy source isn’t available.
-- Fastest high-confidence path is to recover from previous commits/files where these features existed, then merge updater panel in.
-
-## Deliverables
-- Restored multi-timer production flow
-- Restored report feature
-- Updater still operational
-- Updated README with user flow
+## Tradeoff
+Using adjustment fields avoids rewriting historical segments and keeps correction operations reversible/auditable.

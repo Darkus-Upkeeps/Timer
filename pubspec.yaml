@@ -1,7 +1,7 @@
 name: work_timer
 description: Private local work timer for Android
 publish_to: "none"
-version: 1.0.2+3
+version: 1.0.3+4
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -17,6 +17,8 @@ dependencies:
   path_provider: ^2.1.4
   open_filex: ^4.5.0
   flutter_secure_storage: ^9.2.2
+  pdf: ^3.11.1
+  printing: ^5.13.4
 
 flutter:
   uses-material-design: true

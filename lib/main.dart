@@ -11,6 +11,8 @@ import 'package:open_filex/open_filex.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'package:sqflite/sqflite.dart';
 
 void main() {
@@ -67,6 +69,9 @@ class WorkTimer {
   final String product;
   final bool isTotalActive;
   final bool isPartialActive;
+  final int partialAdjustSec;
+  final int totalAdjustSec;
+  final int createdAtMs;
 
   WorkTimer({
     required this.id,
@@ -74,6 +79,9 @@ class WorkTimer {
     required this.product,
     required this.isTotalActive,
     required this.isPartialActive,
+    required this.partialAdjustSec,
+    required this.totalAdjustSec,
+    required this.createdAtMs,
   });
 
   factory WorkTimer.fromMap(Map<String, Object?> m) => WorkTimer(
@@ -82,6 +90,9 @@ class WorkTimer {
         product: m['product'] as String,
         isTotalActive: (m['is_total_active'] as int? ?? 0) == 1,
         isPartialActive: (m['is_partial_active'] as int? ?? 0) == 1,
+        partialAdjustSec: (m['partial_adjust_sec'] as int? ?? 0),
+        totalAdjustSec: (m['total_adjust_sec'] as int? ?? 0),
+        createdAtMs: (m['created_at_ms'] as int? ?? DateTime.now().millisecondsSinceEpoch),
       );
 }
 
@@ -109,7 +120,7 @@ class DB {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 3,
+      version: 4,
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE timers (
@@ -117,7 +128,10 @@ class DB {
             name TEXT NOT NULL,
             product TEXT NOT NULL,
             is_total_active INTEGER NOT NULL DEFAULT 0,
-            is_partial_active INTEGER NOT NULL DEFAULT 0
+            is_partial_active INTEGER NOT NULL DEFAULT 0,
+            partial_adjust_sec INTEGER NOT NULL DEFAULT 0,
+            total_adjust_sec INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL
           )
         ''');
         await db.execute('''
@@ -142,6 +156,9 @@ class DB {
       onUpgrade: (db, oldVersion, _) async {
         await db.execute('ALTER TABLE timers ADD COLUMN is_total_active INTEGER NOT NULL DEFAULT 0').catchError((_) {});
         await db.execute('ALTER TABLE timers ADD COLUMN is_partial_active INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+        await db.execute('ALTER TABLE timers ADD COLUMN partial_adjust_sec INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+        await db.execute('ALTER TABLE timers ADD COLUMN total_adjust_sec INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+        await db.execute('ALTER TABLE timers ADD COLUMN created_at_ms INTEGER').catchError((_) {});
 
         await db.execute('''
           CREATE TABLE IF NOT EXISTS total_sessions (
@@ -183,6 +200,12 @@ class DB {
             }
           }
         }
+
+        if (oldVersion < 4) {
+          await db.rawUpdate('UPDATE timers SET created_at_ms = COALESCE(created_at_ms, strftime("%s","now") * 1000)');
+          await db.rawUpdate('UPDATE timers SET partial_adjust_sec = COALESCE(partial_adjust_sec, 0)');
+          await db.rawUpdate('UPDATE timers SET total_adjust_sec = COALESCE(total_adjust_sec, 0)');
+        }
       },
     );
     return _db!;
@@ -201,12 +224,24 @@ class DB {
       'product': product.trim(),
       'is_total_active': 0,
       'is_partial_active': 0,
+      'partial_adjust_sec': 0,
+      'total_adjust_sec': 0,
+      'created_at_ms': DateTime.now().millisecondsSinceEpoch,
     });
   }
 
-  static Future<void> updateTimer(int id, String name, String product) async {
+  static Future<void> updateTimer(
+    int id,
+    String name,
+    String product, {
+    int? partialAdjustSec,
+    int? totalAdjustSec,
+  }) async {
     final db = await database;
-    await db.update('timers', {'name': name.trim(), 'product': product.trim()}, where: 'id = ?', whereArgs: [id]);
+    final values = <String, Object?>{'name': name.trim(), 'product': product.trim()};
+    if (partialAdjustSec != null) values['partial_adjust_sec'] = partialAdjustSec;
+    if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
+    await db.update('timers', values, where: 'id = ?', whereArgs: [id]);
   }
 
   static Future<void> deleteTimer(int id) async {
@@ -288,6 +323,26 @@ String fmt(Duration d) {
   return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
 }
 
+String fmtDateTime(DateTime dt) {
+  final y = dt.year.toString().padLeft(4, '0');
+  final mo = dt.month.toString().padLeft(2, '0');
+  final d = dt.day.toString().padLeft(2, '0');
+  final h = dt.hour.toString().padLeft(2, '0');
+  final mi = dt.minute.toString().padLeft(2, '0');
+  return '$y-$mo-$d $h:$mi';
+}
+
+int parseDurationInputToSeconds(String input) {
+  final v = input.trim();
+  if (v.isEmpty) return 0;
+  if (v.contains(':')) {
+    final parts = v.split(':').map((e) => int.tryParse(e) ?? 0).toList();
+    if (parts.length == 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length == 2) return parts[0] * 60 + parts[1];
+  }
+  return int.tryParse(v) ?? 0;
+}
+
 class TimerStats {
   final Duration partialToday;
   final Duration totalAllTime;
@@ -314,6 +369,11 @@ Future<TimerStats> computeStats(WorkTimer timer) async {
     if (!end.isAfter(s.startAt)) continue;
     totalAllTime += end.difference(s.startAt);
   }
+
+  partialToday += Duration(seconds: timer.partialAdjustSec);
+  totalAllTime += Duration(seconds: timer.totalAdjustSec);
+  if (partialToday.isNegative) partialToday = Duration.zero;
+  if (totalAllTime.isNegative) totalAllTime = Duration.zero;
 
   return TimerStats(partialToday: partialToday, totalAllTime: totalAllTime);
 }
@@ -346,16 +406,31 @@ class _TimersScreenState extends State<TimersScreen> {
   Future<void> _timerDialog({WorkTimer? timer}) async {
     final nameCtrl = TextEditingController(text: timer?.name ?? '');
     final productCtrl = TextEditingController(text: timer?.product ?? '');
+    final partialCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.partialAdjustSec)));
+    final totalCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.totalAdjustSec)));
+
     await showDialog(
       context: context,
       builder: (_) => AlertDialog(
         title: Text(timer == null ? 'New Timer' : 'Edit Timer'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Task name')),
-            TextField(controller: productCtrl, decoration: const InputDecoration(labelText: 'Product')),
-          ],
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Task name')),
+              TextField(controller: productCtrl, decoration: const InputDecoration(labelText: 'Product')),
+              if (timer != null) ...[
+                TextField(
+                  controller: partialCtrl,
+                  decoration: const InputDecoration(labelText: 'Partial correction (HH:MM:SS or seconds)'),
+                ),
+                TextField(
+                  controller: totalCtrl,
+                  decoration: const InputDecoration(labelText: 'Total correction (HH:MM:SS or seconds)'),
+                ),
+              ],
+            ],
+          ),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
@@ -367,7 +442,13 @@ class _TimersScreenState extends State<TimersScreen> {
               if (timer == null) {
                 await DB.createTimer(n, p);
               } else {
-                await DB.updateTimer(timer.id, n, p);
+                await DB.updateTimer(
+                  timer.id,
+                  n,
+                  p,
+                  partialAdjustSec: parseDurationInputToSeconds(partialCtrl.text),
+                  totalAdjustSec: parseDurationInputToSeconds(totalCtrl.text),
+                );
               }
               if (mounted) {
                 Navigator.pop(context);
@@ -440,6 +521,7 @@ class _TimersScreenState extends State<TimersScreen> {
                         children: [
                           Text(t.name, style: Theme.of(context).textTheme.titleMedium),
                           Text('Product: ${t.product}'),
+                          Text('Created: ${fmtDateTime(DateTime.fromMillisecondsSinceEpoch(t.createdAtMs))}'),
                           const SizedBox(height: 8),
                           Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
@@ -491,6 +573,24 @@ class _TimersScreenState extends State<TimersScreen> {
   }
 }
 
+class ReportLine {
+  final WorkTimer timer;
+  final DateTime start;
+  final DateTime end;
+  final Duration partial;
+  final Duration total;
+  final int pauseMinutes;
+
+  ReportLine({
+    required this.timer,
+    required this.start,
+    required this.end,
+    required this.partial,
+    required this.total,
+    required this.pauseMinutes,
+  });
+}
+
 class ReportsScreen extends StatefulWidget {
   const ReportsScreen({super.key});
 
@@ -515,21 +615,100 @@ class _ReportsScreenState extends State<ReportsScreen> {
     }
   }
 
-  Future<Map<String, Duration>> _buildReport() async {
+  Future<List<ReportLine>> _buildReportLines() async {
     final timers = await DB.getTimers();
-    final (start, end) = _rangeNow();
-    final map = <String, Duration>{};
+    final timerById = {for (final t in timers) t.id: t};
+    final (rangeStart, rangeEnd) = _rangeNow();
 
+    final lines = <ReportLine>[];
     for (final t in timers) {
-      final segs = await DB.getPartialSegmentsForTimer(t.id);
-      Duration sum = Duration.zero;
-      for (final s in segs) {
-        final segEnd = s.endAt ?? DateTime.now();
-        sum += overlapDuration(rangeStart: start, rangeEnd: end, segStart: s.startAt, segEnd: segEnd);
+      final totals = await DB.getTotalSessionsForTimer(t.id);
+      final partials = await DB.getPartialSegmentsForTimer(t.id);
+
+      for (final session in totals) {
+        final rawEnd = session.endAt ?? DateTime.now();
+        final sessionTotal = overlapDuration(
+          rangeStart: rangeStart,
+          rangeEnd: rangeEnd,
+          segStart: session.startAt,
+          segEnd: rawEnd,
+        );
+        if (sessionTotal == Duration.zero) continue;
+
+        Duration partialInSession = Duration.zero;
+        for (final pseg in partials) {
+          final pend = pseg.endAt ?? DateTime.now();
+          partialInSession += overlapDuration(
+            rangeStart: rangeStart,
+            rangeEnd: rangeEnd,
+            segStart: pseg.startAt.isAfter(session.startAt) ? pseg.startAt : session.startAt,
+            segEnd: pend.isBefore(rawEnd) ? pend : rawEnd,
+          );
+        }
+        if (partialInSession > sessionTotal) partialInSession = sessionTotal;
+
+        final pause = (sessionTotal - partialInSession).inMinutes;
+        final timer = timerById[session.timerId];
+        if (timer == null) continue;
+
+        lines.add(ReportLine(
+          timer: timer,
+          start: session.startAt,
+          end: rawEnd,
+          partial: partialInSession,
+          total: sessionTotal,
+          pauseMinutes: pause,
+        ));
       }
-      map[t.product] = (map[t.product] ?? Duration.zero) + sum;
     }
-    return map;
+
+    lines.sort((a, b) => a.start.compareTo(b.start));
+    return lines;
+  }
+
+  Future<void> _exportPdf(List<ReportLine> lines) async {
+    final pdf = pw.Document();
+    final (rangeStart, rangeEnd) = _rangeNow();
+    final totalPartial = lines.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
+
+    pdf.addPage(
+      pw.MultiPage(
+        build: (context) => [
+          pw.Text('Zeitanachweis', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 8),
+          pw.Text('Zeitraum: ${fmtDateTime(rangeStart)} bis ${fmtDateTime(rangeEnd)}'),
+          pw.SizedBox(height: 12),
+          pw.Table.fromTextArray(
+            headers: const ['Datum', 'Beginn', 'Ende', 'Pause (min)', 'Dauer', 'Timer', 'Produkt'],
+            data: [
+              for (final l in lines)
+                [
+                  fmtDateTime(l.start).split(' ').first,
+                  fmtDateTime(l.start).split(' ').last,
+                  fmtDateTime(l.end).split(' ').last,
+                  '${l.pauseMinutes}',
+                  fmt(l.partial),
+                  l.timer.name,
+                  l.timer.product,
+                ],
+            ],
+          ),
+          pw.SizedBox(height: 16),
+          pw.Text('Monatsstunden / Summe: ${fmt(totalPartial)}'),
+          pw.SizedBox(height: 24),
+          pw.Row(
+            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+            children: [
+              pw.Text('Datum: ____________________'),
+              pw.Text('Signatur: ____________________'),
+            ],
+          ),
+        ],
+      ),
+    );
+
+    final bytes = await pdf.save();
+    await Printing.layoutPdf(onLayout: (_) async => bytes);
   }
 
   @override
@@ -554,16 +733,37 @@ class _ReportsScreenState extends State<ReportsScreen> {
           const SizedBox(width: 12),
         ],
       ),
-      body: FutureBuilder<Map<String, Duration>>(
-        future: _buildReport(),
+      body: FutureBuilder<List<ReportLine>>(
+        future: _buildReportLines(),
         builder: (context, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final data = snap.data!;
-          if (data.isEmpty) return const Center(child: Text('No data yet.'));
-          final sorted = data.entries.toList()..sort((a, b) => b.value.inSeconds.compareTo(a.value.inSeconds));
+          final lines = snap.data!;
+          if (lines.isEmpty) return const Center(child: Text('No data yet.'));
+          final totalPartial = lines.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
 
           return ListView(
-            children: [for (final e in sorted) ListTile(title: Text(e.key), trailing: Text(fmt(e.value)))],
+            padding: const EdgeInsets.all(12),
+            children: [
+              Card(
+                child: ListTile(
+                  title: const Text('Total partial time'),
+                  subtitle: Text(fmt(totalPartial)),
+                  trailing: OutlinedButton.icon(
+                    onPressed: () => _exportPdf(lines),
+                    icon: const Icon(Icons.picture_as_pdf),
+                    label: const Text('PDF'),
+                  ),
+                ),
+              ),
+              for (final l in lines)
+                Card(
+                  child: ListTile(
+                    title: Text('${l.timer.name} • ${l.timer.product}'),
+                    subtitle: Text('${fmtDateTime(l.start)} → ${fmtDateTime(l.end)}\nPause: ${l.pauseMinutes} min'),
+                    trailing: Text(fmt(l.partial)),
+                  ),
+                ),
+            ],
           );
         },
       ),
