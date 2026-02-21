@@ -240,11 +240,26 @@ class DB {
     int? createdAtMs,
   }) async {
     final db = await database;
-    final values = <String, Object?>{'name': name.trim(), 'product': product.trim()};
-    if (partialAdjustSec != null) values['partial_adjust_sec'] = partialAdjustSec;
-    if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
-    if (createdAtMs != null) values['created_at_ms'] = createdAtMs;
-    await db.update('timers', values, where: 'id = ?', whereArgs: [id]);
+    await db.transaction((txn) async {
+      final values = <String, Object?>{'name': name.trim(), 'product': product.trim()};
+      if (partialAdjustSec != null) values['partial_adjust_sec'] = partialAdjustSec;
+      if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
+
+      if (createdAtMs != null) {
+        final current = await txn.query('timers', columns: ['created_at_ms'], where: 'id = ?', whereArgs: [id], limit: 1);
+        final oldCreated = (current.isNotEmpty ? (current.first['created_at_ms'] as int?) : null) ?? createdAtMs;
+        final delta = createdAtMs - oldCreated;
+
+        if (delta != 0) {
+          await txn.rawUpdate('UPDATE total_sessions SET start_at_ms = start_at_ms + ?, end_at_ms = CASE WHEN end_at_ms IS NULL THEN NULL ELSE end_at_ms + ? END WHERE timer_id = ?', [delta, delta, id]);
+          await txn.rawUpdate('UPDATE partial_segments SET start_at_ms = start_at_ms + ?, end_at_ms = CASE WHEN end_at_ms IS NULL THEN NULL ELSE end_at_ms + ? END WHERE timer_id = ?', [delta, delta, id]);
+        }
+
+        values['created_at_ms'] = createdAtMs;
+      }
+
+      await txn.update('timers', values, where: 'id = ?', whereArgs: [id]);
+    });
   }
 
   static Future<void> deleteTimer(int id) async {
@@ -782,6 +797,12 @@ class _ReportsScreenState extends State<ReportsScreen> {
 
   DateTime _weekStart(DateTime d) => DateTime(d.year, d.month, d.day).subtract(Duration(days: d.weekday - 1));
 
+  int _isoWeek(DateTime d) {
+    final thursday = d.add(Duration(days: 4 - d.weekday));
+    final firstJan = DateTime(thursday.year, 1, 1);
+    return ((thursday.difference(firstJan).inDays) / 7).floor() + 1;
+  }
+
   String _safeName(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '-').replaceAll(RegExp(r'-+'), '-').replaceAll(RegExp(r'^-|-$'), '');
 
   String _pdfFileName(List<ReportLine> lines) {
@@ -811,10 +832,12 @@ class _ReportsScreenState extends State<ReportsScreen> {
       }
       final keys = grouped.keys.toList()..sort((a, b) => a.compareTo(b));
 
+      final weekSummary = <List<String>>[];
       for (final wk in keys) {
         final block = grouped[wk]!;
         final weekTotal = block.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
-        widgets.add(pw.Text('Woche ab ${fmtDateTime(wk).split(' ').first}', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)));
+        final kw = _isoWeek(wk);
+        widgets.add(pw.Text('KW $kw • Woche ab ${fmtDateTime(wk).split(' ').first}', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)));
         widgets.add(
           pw.Table.fromTextArray(
             headers: const ['Datum', 'Beginn', 'Ende', 'Pause (min)', 'Dauer', 'Timer', 'Produkt'],
@@ -834,8 +857,18 @@ class _ReportsScreenState extends State<ReportsScreen> {
         );
         widgets.add(pw.SizedBox(height: 4));
         widgets.add(pw.Text('Wochensumme: ${fmt(weekTotal)}'));
+        weekSummary.add(['KW $kw', fmt(weekTotal)]);
         widgets.add(pw.SizedBox(height: 12));
       }
+
+      widgets.add(pw.Text('Wochenübersicht', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)));
+      widgets.add(
+        pw.Table.fromTextArray(
+          headers: const ['Kalenderwoche', 'Summe'],
+          data: weekSummary,
+        ),
+      );
+      widgets.add(pw.SizedBox(height: 12));
     } else {
       widgets.add(
         pw.Table.fromTextArray(
