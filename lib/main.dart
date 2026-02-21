@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
@@ -666,22 +667,46 @@ class _ReportsScreenState extends State<ReportsScreen> {
     return lines;
   }
 
-  Future<void> _exportPdf(List<ReportLine> lines) async {
+  DateTime _weekStart(DateTime d) => DateTime(d.year, d.month, d.day).subtract(Duration(days: d.weekday - 1));
+
+  String _safeName(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '-').replaceAll(RegExp(r'-+'), '-').replaceAll(RegExp(r'^-|-$'), '');
+
+  String _pdfFileName(List<ReportLine> lines) {
+    final date = DateTime.now();
+    final ds = '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+    final names = lines.map((e) => e.timer.name).toSet().toList();
+    if (names.length == 1) return '${_safeName(names.first)}-$ds.pdf';
+    return 'report-$ds.pdf';
+  }
+
+  Future<Uint8List> _buildPdfBytes(List<ReportLine> lines) async {
     final pdf = pw.Document();
     final (rangeStart, rangeEnd) = _rangeNow();
     final totalPartial = lines.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
 
-    pdf.addPage(
-      pw.MultiPage(
-        build: (context) => [
-          pw.Text('Zeitanachweis', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 8),
-          pw.Text('Zeitraum: ${fmtDateTime(rangeStart)} bis ${fmtDateTime(rangeEnd)}'),
-          pw.SizedBox(height: 12),
+    final widgets = <pw.Widget>[
+      pw.Text('Zeitanachweis', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
+      pw.SizedBox(height: 8),
+      pw.Text('Zeitraum: ${fmtDateTime(rangeStart)} bis ${fmtDateTime(rangeEnd)}'),
+      pw.SizedBox(height: 12),
+    ];
+
+    if (period == 'month') {
+      final grouped = <DateTime, List<ReportLine>>{};
+      for (final l in lines) {
+        grouped.putIfAbsent(_weekStart(l.start), () => []).add(l);
+      }
+      final keys = grouped.keys.toList()..sort((a, b) => a.compareTo(b));
+
+      for (final wk in keys) {
+        final block = grouped[wk]!;
+        final weekTotal = block.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
+        widgets.add(pw.Text('Woche ab ${fmtDateTime(wk).split(' ').first}', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)));
+        widgets.add(
           pw.Table.fromTextArray(
             headers: const ['Datum', 'Beginn', 'Ende', 'Pause (min)', 'Dauer', 'Timer', 'Produkt'],
             data: [
-              for (final l in lines)
+              for (final l in block)
                 [
                   fmtDateTime(l.start).split(' ').first,
                   fmtDateTime(l.start).split(' ').last,
@@ -693,22 +718,56 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 ],
             ],
           ),
-          pw.SizedBox(height: 16),
-          pw.Text('Monatsstunden / Summe: ${fmt(totalPartial)}'),
-          pw.SizedBox(height: 24),
-          pw.Row(
-            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-            children: [
-              pw.Text('Datum: ____________________'),
-              pw.Text('Signatur: ____________________'),
-            ],
-          ),
+        );
+        widgets.add(pw.SizedBox(height: 4));
+        widgets.add(pw.Text('Wochensumme: ${fmt(weekTotal)}'));
+        widgets.add(pw.SizedBox(height: 12));
+      }
+    } else {
+      widgets.add(
+        pw.Table.fromTextArray(
+          headers: const ['Datum', 'Beginn', 'Ende', 'Pause (min)', 'Dauer', 'Timer', 'Produkt'],
+          data: [
+            for (final l in lines)
+              [
+                fmtDateTime(l.start).split(' ').first,
+                fmtDateTime(l.start).split(' ').last,
+                fmtDateTime(l.end).split(' ').last,
+                '${l.pauseMinutes}',
+                fmt(l.partial),
+                l.timer.name,
+                l.timer.product,
+              ],
+          ],
+        ),
+      );
+      widgets.add(pw.SizedBox(height: 12));
+    }
+
+    widgets.add(pw.Text('Monatssumme / Gesamt: ${fmt(totalPartial)}'));
+    widgets.add(pw.SizedBox(height: 24));
+    widgets.add(
+      pw.Row(
+        mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+        children: [
+          pw.Text('Datum: ____________________'),
+          pw.Text('Signatur: ____________________'),
         ],
       ),
     );
 
-    final bytes = await pdf.save();
-    await Printing.layoutPdf(onLayout: (_) async => bytes);
+    pdf.addPage(pw.MultiPage(build: (_) => widgets));
+    return pdf.save();
+  }
+
+  Future<void> _exportPdf(List<ReportLine> lines) async {
+    final bytes = await _buildPdfBytes(lines);
+    await Printing.layoutPdf(onLayout: (_) async => bytes, name: _pdfFileName(lines));
+  }
+
+  Future<void> _sharePdf(List<ReportLine> lines) async {
+    final bytes = await _buildPdfBytes(lines);
+    await Printing.sharePdf(bytes: bytes, filename: _pdfFileName(lines));
   }
 
   @override
@@ -745,13 +804,31 @@ class _ReportsScreenState extends State<ReportsScreen> {
             padding: const EdgeInsets.all(12),
             children: [
               Card(
-                child: ListTile(
-                  title: const Text('Total partial time'),
-                  subtitle: Text(fmt(totalPartial)),
-                  trailing: OutlinedButton.icon(
-                    onPressed: () => _exportPdf(lines),
-                    icon: const Icon(Icons.picture_as_pdf),
-                    label: const Text('PDF'),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Total partial time'),
+                      Text(fmt(totalPartial)),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: () => _exportPdf(lines),
+                            icon: const Icon(Icons.picture_as_pdf),
+                            label: const Text('Print PDF'),
+                          ),
+                          FilledButton.icon(
+                            onPressed: () => _sharePdf(lines),
+                            icon: const Icon(Icons.share),
+                            label: const Text('Share'),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
                 ),
               ),
