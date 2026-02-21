@@ -98,13 +98,15 @@ class WorkTimer {
 }
 
 class Segment {
+  final int id;
   final int timerId;
   final DateTime startAt;
   final DateTime? endAt;
 
-  Segment({required this.timerId, required this.startAt, this.endAt});
+  Segment({required this.id, required this.timerId, required this.startAt, this.endAt});
 
   factory Segment.fromMap(Map<String, Object?> m) => Segment(
+        id: m['id'] as int,
         timerId: m['timer_id'] as int,
         startAt: DateTime.fromMillisecondsSinceEpoch(m['start_at_ms'] as int),
         endAt: m['end_at_ms'] == null
@@ -246,9 +248,12 @@ class DB {
       if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
 
       if (createdAtMs != null) {
-        final current = await txn.query('timers', columns: ['created_at_ms'], where: 'id = ?', whereArgs: [id], limit: 1);
-        final oldCreated = (current.isNotEmpty ? (current.first['created_at_ms'] as int?) : null) ?? createdAtMs;
-        final delta = createdAtMs - oldCreated;
+        final firstSession = await txn.rawQuery(
+          'SELECT MIN(start_at_ms) AS first_start FROM total_sessions WHERE timer_id = ?',
+          [id],
+        );
+        final firstStart = (firstSession.first['first_start'] as int?) ?? createdAtMs;
+        final delta = createdAtMs - firstStart;
 
         if (delta != 0) {
           await txn.rawUpdate('UPDATE total_sessions SET start_at_ms = start_at_ms + ?, end_at_ms = CASE WHEN end_at_ms IS NULL THEN NULL ELSE end_at_ms + ? END WHERE timer_id = ?', [delta, delta, id]);
@@ -324,6 +329,27 @@ class DB {
     final db = await database;
     final rows = await db.query('total_sessions', where: 'timer_id = ?', whereArgs: [timerId], orderBy: 'start_at_ms ASC');
     return rows.map(Segment.fromMap).toList();
+  }
+
+  static Future<void> deleteReportEntry({
+    required int timerId,
+    required int totalSessionId,
+    required int sessionStartMs,
+    required int sessionEndMs,
+  }) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('total_sessions', where: 'id = ?', whereArgs: [totalSessionId]);
+      await txn.rawDelete(
+        '''
+        DELETE FROM partial_segments
+        WHERE timer_id = ?
+          AND start_at_ms >= ?
+          AND COALESCE(end_at_ms, start_at_ms) <= ?
+        ''',
+        [timerId, sessionStartMs, sessionEndMs],
+      );
+    });
   }
 }
 
@@ -659,6 +685,7 @@ class _TimersScreenState extends State<TimersScreen> {
 
 class ReportLine {
   final WorkTimer timer;
+  final int totalSessionId;
   final DateTime start;
   final DateTime end;
   final Duration partial;
@@ -667,6 +694,7 @@ class ReportLine {
 
   ReportLine({
     required this.timer,
+    required this.totalSessionId,
     required this.start,
     required this.end,
     required this.partial,
@@ -683,6 +711,7 @@ class ReportLine {
   }) {
     return ReportLine(
       timer: timer,
+      totalSessionId: totalSessionId,
       start: start ?? this.start,
       end: end ?? this.end,
       partial: partial ?? this.partial,
@@ -754,6 +783,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
 
         lines.add(ReportLine(
           timer: timer,
+          totalSessionId: session.id,
           start: session.startAt,
           end: rawEnd,
           partial: partialInSession,
@@ -983,7 +1013,26 @@ class _ReportsScreenState extends State<ReportsScreen> {
                   child: ListTile(
                     title: Text('${l.timer.name} • ${l.timer.product}'),
                     subtitle: Text('${fmtDateTime(l.start)} → ${fmtDateTime(l.end)}\nPause: ${l.pauseMinutes} min'),
-                    trailing: Text(fmt(l.partial)),
+                    trailing: Wrap(
+                      spacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(fmt(l.partial)),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          tooltip: 'Delete report entry',
+                          onPressed: () async {
+                            await DB.deleteReportEntry(
+                              timerId: l.timer.id,
+                              totalSessionId: l.totalSessionId,
+                              sessionStartMs: l.start.millisecondsSinceEpoch,
+                              sessionEndMs: l.end.millisecondsSinceEpoch,
+                            );
+                            if (mounted) setState(() {});
+                          },
+                        ),
+                      ],
+                    ),
                   ),
                 ),
             ],
