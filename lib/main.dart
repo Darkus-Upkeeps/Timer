@@ -688,7 +688,16 @@ class _UpdatesScreenState extends State<UpdatesScreen> {
     });
 
     try {
-      final dir = await getApplicationDocumentsDirectory();
+      Directory dir;
+      if (Platform.isAndroid) {
+        dir = Directory('/storage/emulated/0/Download');
+        if (!await dir.exists()) {
+          dir = (await getExternalStorageDirectory()) ?? await getApplicationDocumentsDirectory();
+        }
+      } else {
+        dir = await getApplicationDocumentsDirectory();
+      }
+
       final out = File('${dir.path}/${m.apkFileName}');
       final req = await HttpClient().getUrl(Uri.parse(m.apkApiUrl));
       req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
@@ -705,8 +714,9 @@ class _UpdatesScreenState extends State<UpdatesScreen> {
         throw Exception('Checksum mismatch');
       }
 
+      setState(() => _status = 'Downloaded: ${out.path}');
       final result = await OpenFilex.open(out.path, type: 'application/vnd.android.package-archive');
-      setState(() => _status = 'Installer result: ${result.message}');
+      setState(() => _status = 'Installer: ${result.type} ${result.message}. If blocked, allow "Install unknown apps" for Work Timer.');
     } catch (e) {
       setState(() => _status = 'Install failed: $e');
     } finally {
