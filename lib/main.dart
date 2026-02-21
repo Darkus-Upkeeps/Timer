@@ -237,11 +237,13 @@ class DB {
     String product, {
     int? partialAdjustSec,
     int? totalAdjustSec,
+    int? createdAtMs,
   }) async {
     final db = await database;
     final values = <String, Object?>{'name': name.trim(), 'product': product.trim()};
     if (partialAdjustSec != null) values['partial_adjust_sec'] = partialAdjustSec;
     if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
+    if (createdAtMs != null) values['created_at_ms'] = createdAtMs;
     await db.update('timers', values, where: 'id = ?', whereArgs: [id]);
   }
 
@@ -409,56 +411,122 @@ class _TimersScreenState extends State<TimersScreen> {
     final productCtrl = TextEditingController(text: timer?.product ?? '');
     final partialCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.partialAdjustSec)));
     final totalCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.totalAdjustSec)));
+    DateTime selectedCreated = timer == null
+        ? DateTime.now()
+        : DateTime.fromMillisecondsSinceEpoch(timer.createdAtMs);
+
+    Future<void> pickDate(StateSetter setLocal) async {
+      final picked = await showDatePicker(
+        context: context,
+        initialDate: selectedCreated,
+        firstDate: DateTime(2020),
+        lastDate: DateTime(2100),
+      );
+      if (picked != null) {
+        selectedCreated = DateTime(
+          picked.year,
+          picked.month,
+          picked.day,
+          selectedCreated.hour,
+          selectedCreated.minute,
+        );
+        setLocal(() {});
+      }
+    }
+
+    Future<void> pickTime(StateSetter setLocal) async {
+      final picked = await showTimePicker(
+        context: context,
+        initialTime: TimeOfDay.fromDateTime(selectedCreated),
+      );
+      if (picked != null) {
+        selectedCreated = DateTime(
+          selectedCreated.year,
+          selectedCreated.month,
+          selectedCreated.day,
+          picked.hour,
+          picked.minute,
+        );
+        setLocal(() {});
+      }
+    }
+
+    Future<void> pickCorrection(TextEditingController ctrl) async {
+      final picked = await showTimePicker(
+        context: context,
+        initialTime: const TimeOfDay(hour: 0, minute: 0),
+      );
+      if (picked != null) {
+        ctrl.text = '${picked.hour.toString().padLeft(2, '0')}:${picked.minute.toString().padLeft(2, '0')}:00';
+      }
+    }
 
     await showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        title: Text(timer == null ? 'New Timer' : 'Edit Timer'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Task name')),
-              TextField(controller: productCtrl, decoration: const InputDecoration(labelText: 'Product')),
-              if (timer != null) ...[
-                TextField(
-                  controller: partialCtrl,
-                  decoration: const InputDecoration(labelText: 'Partial correction (HH:MM:SS or seconds)'),
-                ),
-                TextField(
-                  controller: totalCtrl,
-                  decoration: const InputDecoration(labelText: 'Total correction (HH:MM:SS or seconds)'),
-                ),
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: Text(timer == null ? 'New Timer' : 'Edit Timer'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Task name')),
+                TextField(controller: productCtrl, decoration: const InputDecoration(labelText: 'Product')),
+                if (timer != null) ...[
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(child: Text('Created: ${fmtDateTime(selectedCreated)}')),
+                      IconButton(onPressed: () => pickDate(setLocal), icon: const Icon(Icons.calendar_today)),
+                      IconButton(onPressed: () => pickTime(setLocal), icon: const Icon(Icons.schedule)),
+                    ],
+                  ),
+                  TextField(
+                    controller: partialCtrl,
+                    decoration: InputDecoration(
+                      labelText: 'Partial correction (HH:MM:SS or seconds)',
+                      suffixIcon: IconButton(onPressed: () => pickCorrection(partialCtrl), icon: const Icon(Icons.schedule)),
+                    ),
+                  ),
+                  TextField(
+                    controller: totalCtrl,
+                    decoration: InputDecoration(
+                      labelText: 'Total correction (HH:MM:SS or seconds)',
+                      suffixIcon: IconButton(onPressed: () => pickCorrection(totalCtrl), icon: const Icon(Icons.schedule)),
+                    ),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () async {
+                final n = nameCtrl.text.trim();
+                final p = productCtrl.text.trim();
+                if (n.isEmpty || p.isEmpty) return;
+                if (timer == null) {
+                  await DB.createTimer(n, p);
+                } else {
+                  await DB.updateTimer(
+                    timer.id,
+                    n,
+                    p,
+                    partialAdjustSec: parseDurationInputToSeconds(partialCtrl.text),
+                    totalAdjustSec: parseDurationInputToSeconds(totalCtrl.text),
+                    createdAtMs: selectedCreated.millisecondsSinceEpoch,
+                  );
+                }
+                if (mounted) {
+                  Navigator.pop(ctx);
+                  setState(() {});
+                }
+              },
+              child: const Text('Save'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () async {
-              final n = nameCtrl.text.trim();
-              final p = productCtrl.text.trim();
-              if (n.isEmpty || p.isEmpty) return;
-              if (timer == null) {
-                await DB.createTimer(n, p);
-              } else {
-                await DB.updateTimer(
-                  timer.id,
-                  n,
-                  p,
-                  partialAdjustSec: parseDurationInputToSeconds(partialCtrl.text),
-                  totalAdjustSec: parseDurationInputToSeconds(totalCtrl.text),
-                );
-              }
-              if (mounted) {
-                Navigator.pop(context);
-                setState(() {});
-              }
-            },
-            child: const Text('Save'),
-          ),
-        ],
       ),
     );
   }
@@ -590,6 +658,23 @@ class ReportLine {
     required this.total,
     required this.pauseMinutes,
   });
+
+  ReportLine copyWith({
+    DateTime? start,
+    DateTime? end,
+    Duration? partial,
+    Duration? total,
+    int? pauseMinutes,
+  }) {
+    return ReportLine(
+      timer: timer,
+      start: start ?? this.start,
+      end: end ?? this.end,
+      partial: partial ?? this.partial,
+      total: total ?? this.total,
+      pauseMinutes: pauseMinutes ?? this.pauseMinutes,
+    );
+  }
 }
 
 class ReportsScreen extends StatefulWidget {
@@ -661,6 +746,34 @@ class _ReportsScreenState extends State<ReportsScreen> {
           pauseMinutes: pause,
         ));
       }
+    }
+
+    // Apply timer-level corrections so reports stay in sync with edit values.
+    final byTimer = <int, List<int>>{};
+    for (var i = 0; i < lines.length; i++) {
+      byTimer.putIfAbsent(lines[i].timer.id, () => []).add(i);
+    }
+
+    for (final t in timers) {
+      final idxs = byTimer[t.id] ?? const <int>[];
+      if (idxs.isEmpty) continue;
+      var line = lines[idxs.first];
+
+      if (t.partialAdjustSec != 0) {
+        var newPartial = line.partial + Duration(seconds: t.partialAdjustSec);
+        if (newPartial.isNegative) newPartial = Duration.zero;
+        final newPause = (line.total - newPartial).inMinutes < 0 ? 0 : (line.total - newPartial).inMinutes;
+        line = line.copyWith(partial: newPartial, pauseMinutes: newPause);
+      }
+
+      if (t.totalAdjustSec != 0) {
+        var newTotal = line.total + Duration(seconds: t.totalAdjustSec);
+        if (newTotal.isNegative) newTotal = Duration.zero;
+        final newPause = (newTotal - line.partial).inMinutes < 0 ? 0 : (newTotal - line.partial).inMinutes;
+        line = line.copyWith(total: newTotal, pauseMinutes: newPause);
+      }
+
+      lines[idxs.first] = line;
     }
 
     lines.sort((a, b) => a.start.compareTo(b.start));

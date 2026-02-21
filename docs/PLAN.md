@@ -1,43 +1,32 @@
-# PLAN.md — Edit-All Values + Datestamp Restore
+# PLAN.md — Report Sync + Editable Date/Time Controls
 
 ## Root Cause
-Current restored UI supports editing timer metadata (name/product) but does not expose correction controls for recorded time values (partial/total). Datestamp display from earlier commits was also dropped during refactors.
+- Report aggregates are based on stored segments and currently do not fully apply edit corrections in all report views/exports.
+- Timer edit UI lacks direct date editing.
+- Time/date edits currently rely on raw text entry only.
 
 ## Target Behavior
-1. **Edit function can adjust all relevant values**
-   - Name
-   - Product
-   - Partial time (today correction)
-   - Total time (all-time correction)
-2. **Datestamp is visible again**
-   - Show timer created date on timer cards
-   - Preserve existing data for older timers (fallback when missing)
-3. **Printable PDF report export**
-   - Generate Zeitanachweis-style PDF
-   - Include timer name, product, date, start, end, pause, duration, totals
-   - Include signature section (Signatur line)
+1. **Report sync after edits**
+   - Any timer edit (name/product/partial/total/date) must immediately reflect in report screen + PDF.
+2. **Editable timer date**
+   - User can change timer created date/time.
+3. **Common date/time pickers**
+   - Use native picker controls (date picker + time picker), not only text typing.
 
 ## Implementation Plan
-1. **Schema update (safe migration)**
-   - Add `created_at_ms` to `timers` (default now for new rows, backfill old rows).
-2. **Time correction model**
-   - Add correction columns on `timers`:
-     - `partial_adjust_sec` (default 0)
-     - `total_adjust_sec` (default 0)
-   - Keep raw sessions/segments immutable; apply correction at read time.
-3. **Edit dialog upgrade**
-   - Add inputs for partial and total correction (seconds/minutes UX).
-   - Validate no invalid numbers.
-4. **Computation updates**
-   - Timer cards: displayed Partial/Total = computed base + adjustment.
-   - Reports: include partial adjustments where relevant.
-5. **Datestamp UI**
-   - Render `Created: YYYY-MM-DD HH:mm` on timer cards.
-6. **Verification**
-   - Create timer -> datestamp shows.
-   - Edit name/product/time corrections -> values update instantly.
-   - Report reflects adjusted partial values.
-   - Updater flow remains unchanged.
+1. **Data layer**
+   - Ensure `created_at_ms` is writable in timer update API.
+   - Ensure report computations apply adjustments consistently.
+2. **Edit dialog UX**
+   - Add date + time fields with picker buttons.
+   - Keep optional manual input fallback, but picker-first.
+3. **Report pipeline**
+   - Apply corrections to report lines and totals (screen + PDF).
+   - Keep weekly/monthly sums aligned with corrected values.
+4. **Validation**
+   - Edit a timer’s partial/total/date; verify list card, report list, and PDF all update consistently.
 
-## Tradeoff
-Using adjustment fields avoids rewriting historical segments and keeps correction operations reversible/auditable.
+## Deliverables
+- Synced corrected reports
+- Date/time editable via pickers
+- Stable updater flow unchanged
