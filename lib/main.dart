@@ -635,7 +635,9 @@ class _TimersScreenState extends State<TimersScreen> {
                     builder: (context, statsSnap) {
                       final partial = statsSnap.data?.partialToday ?? Duration.zero;
                       final total = statsSnap.data?.totalAllTime ?? Duration.zero;
-
+                      
+                      String avgText = t.pieces > 0 ? fmt(Duration(seconds: (partial.inSeconds / t.pieces).round())) : '---';
+                      
                       final primaryLabel = !t.isTotalActive ? 'Start' : (t.isPartialActive ? 'Pause' : 'Resume');
                       final primaryIcon = !t.isTotalActive ? Icons.play_arrow : (t.isPartialActive ? Icons.pause : Icons.play_arrow);
 
