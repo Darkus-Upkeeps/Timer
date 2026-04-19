@@ -584,6 +584,42 @@ class _TimersScreenState extends State<TimersScreen> {
       ),
     );
   }
+  Future<void> _piecesDialog(WorkTimer t) async {
+    // 1. Controller erstellt und lädt die aktuelle Stückzahl
+    final ctrl = TextEditingController(text: t.pieces.toString());
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Stücke eintragen'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: TextInputType.number, // Öffnet direkt den Ziffernblock am Handy
+          decoration: const InputDecoration(labelText: 'Anzahl'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Abbrechen')),
+          FilledButton(
+            onPressed: () async {
+              // 2. Textfeld auslesen und in eine Zahl verwandeln
+              final newPieces = int.tryParse(ctrl.text.trim()) ?? 0;
+              
+              // 3. DEINE AUFGABE: Datenbank aktualisieren!
+              // HIER FEHLT DER CODE
+             await DB.updateTimer(t.id, t.name, t.product, pieces: newPieces);
+
+              
+              if (mounted) {
+                Navigator.pop(ctx);
+                setState(() {}); // App-Anzeige aktualisieren
+              }
+            },
+            child: const Text('Speichern'),
+          ),
+        ],
+      ),
+    );
+  }
 
   Future<void> _primaryAction(WorkTimer t) async {
     if (!t.isTotalActive) {
@@ -669,6 +705,7 @@ Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
                                 icon: const Icon(Icons.stop),
                                 label: const Text('Stop'),
                               ),
+                              OutlinedButton.icon(onPressed: () => _piecesDialog(t), icon: const Icon(Icons.add_box), label: const Text('Stück')),
                               OutlinedButton.icon(onPressed: () => _timerDialog(timer: t), icon: const Icon(Icons.edit), label: const Text('Edit')),
                               TextButton.icon(
                                 onPressed: () async {
