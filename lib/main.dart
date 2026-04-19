@@ -73,6 +73,7 @@ class WorkTimer {
   final int partialAdjustSec;
   final int totalAdjustSec;
   final int createdAtMs;
+  final int pieces;
 
   WorkTimer({
     required this.id,
@@ -83,6 +84,8 @@ class WorkTimer {
     required this.partialAdjustSec,
     required this.totalAdjustSec,
     required this.createdAtMs,
+    required this.pieces,
+    
   });
 
   factory WorkTimer.fromMap(Map<String, Object?> m) => WorkTimer(
@@ -94,6 +97,9 @@ class WorkTimer {
         partialAdjustSec: (m['partial_adjust_sec'] as int? ?? 0),
         totalAdjustSec: (m['total_adjust_sec'] as int? ?? 0),
         createdAtMs: (m['created_at_ms'] as int? ?? DateTime.now().millisecondsSinceEpoch),
+        pieces:
+(m['pieces'] as int? ?? 0 ),
+       
       );
 }
 
@@ -134,7 +140,8 @@ class DB {
             is_partial_active INTEGER NOT NULL DEFAULT 0,
             partial_adjust_sec INTEGER NOT NULL DEFAULT 0,
             total_adjust_sec INTEGER NOT NULL DEFAULT 0,
-            created_at_ms INTEGER NOT NULL
+            created_at_ms INTEGER NOT NULL,
+            pieces INTEGER NOT NULL DEFAULT 0
           )
         ''');
         await db.execute('''
@@ -230,6 +237,7 @@ class DB {
       'partial_adjust_sec': 0,
       'total_adjust_sec': 0,
       'created_at_ms': DateTime.now().millisecondsSinceEpoch,
+      'pieces': 0,
     });
   }
 
@@ -240,18 +248,21 @@ class DB {
     int? partialAdjustSec,
     int? totalAdjustSec,
     int? createdAtMs,
+    int? pieces,
   }) async {
     final db = await database;
     await db.transaction((txn) async {
       final values = <String, Object?>{'name': name.trim(), 'product': product.trim()};
       if (partialAdjustSec != null) values['partial_adjust_sec'] = partialAdjustSec;
       if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
-
+      if (pieces != null) 
+values['pieces'] = pieces;
       if (createdAtMs != null) {
         final firstSession = await txn.rawQuery(
           'SELECT MIN(start_at_ms) AS first_start FROM total_sessions WHERE timer_id = ?',
           [id],
         );
+      
         final firstStart = (firstSession.first['first_start'] as int?) ?? createdAtMs;
         final delta = createdAtMs - firstStart;
 
@@ -402,6 +413,8 @@ Future<TimerStats> computeStats(WorkTimer timer) async {
 
   Duration partialToday = Duration.zero;
   Duration totalAllTime = Duration.zero;
+
+
 
   for (final s in partialSegs) {
     final end = s.endAt ?? now;
@@ -635,6 +648,8 @@ class _TimersScreenState extends State<TimersScreen> {
                           const SizedBox(height: 8),
                           Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
+Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
+
                           const SizedBox(height: 10),
                           Wrap(
                             spacing: 8,
