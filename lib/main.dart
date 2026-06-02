@@ -16,6 +16,8 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:sqflite/sqflite.dart';
 
+import 'report_range.dart';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const WorkTimerApp());
@@ -784,19 +786,49 @@ class ReportsScreen extends StatefulWidget {
 
 class _ReportsScreenState extends State<ReportsScreen> {
   String period = 'today';
+  DateTime selectedMonth = monthStart(DateTime.now());
 
   (DateTime, DateTime) _rangeNow() {
+    final range = reportRangeFor(period: period, now: DateTime.now(), selectedMonth: selectedMonth);
+    return (range.start, range.end);
+  }
+
+  String _monthLabel(DateTime date) {
+    const months = [
+      'January',
+      'February',
+      'March',
+      'April',
+      'May',
+      'June',
+      'July',
+      'August',
+      'September',
+      'October',
+      'November',
+      'December',
+    ];
+    return '${months[date.month - 1]} ${date.year}';
+  }
+
+  bool _canGoToNextMonth() => monthStart(selectedMonth).isBefore(monthStart(DateTime.now()));
+
+  void _shiftSelectedMonth(int delta) {
+    final next = monthStart(DateTime(selectedMonth.year, selectedMonth.month + delta, 1));
+    if (next.isAfter(monthStart(DateTime.now()))) return;
+    setState(() => selectedMonth = next);
+  }
+
+  Future<void> _pickReportMonth() async {
     final now = DateTime.now();
-    if (period == 'today') {
-      return (DateTime(now.year, now.month, now.day), now);
-    } else if (period == 'week') {
-      final weekday = now.weekday;
-      final start = DateTime(now.year, now.month, now.day).subtract(Duration(days: weekday - 1));
-      return (start, now);
-    } else {
-      final start = DateTime(now.year, now.month, 1);
-      return (start, now);
-    }
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: selectedMonth.isAfter(now) ? now : selectedMonth,
+      firstDate: DateTime(2000),
+      lastDate: now,
+    );
+    if (picked == null) return;
+    setState(() => selectedMonth = monthStart(picked));
   }
 
   Future<List<ReportLine>> _buildReportLines() async {
@@ -890,8 +922,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
   String _safeName(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '-').replaceAll(RegExp(r'-+'), '-').replaceAll(RegExp(r'^-|-$'), '');
 
   String _pdfFileName(List<ReportLine> lines) {
-    final date = DateTime.now();
-    final ds = '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+    final date = period == 'month' ? selectedMonth : DateTime.now();
+    final day = period == 'month' ? '' : '-${date.day.toString().padLeft(2, '0')}';
+    final ds = '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}$day';
     final names = lines.map((e) => e.timer.name).toSet().toList();
     if (names.length == 1) return '${_safeName(names.first)}-$ds.pdf';
     return 'report-$ds.pdf';
@@ -1016,7 +1049,6 @@ class _ReportsScreenState extends State<ReportsScreen> {
         builder: (context, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
           final lines = snap.data!;
-          if (lines.isEmpty) return const Center(child: Text('No data yet.'));
           final totalPartial = lines.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
 
           return ListView(
@@ -1028,6 +1060,31 @@ class _ReportsScreenState extends State<ReportsScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      if (period == 'month') ...[
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            IconButton(
+                              onPressed: () => _shiftSelectedMonth(-1),
+                              tooltip: 'Previous month',
+                              icon: const Icon(Icons.chevron_left),
+                            ),
+                            OutlinedButton.icon(
+                              onPressed: _pickReportMonth,
+                              icon: const Icon(Icons.calendar_month),
+                              label: Text(_monthLabel(selectedMonth)),
+                            ),
+                            IconButton(
+                              onPressed: _canGoToNextMonth() ? () => _shiftSelectedMonth(1) : null,
+                              tooltip: 'Next month',
+                              icon: const Icon(Icons.chevron_right),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                      ],
                       const Text('Total partial time'),
                       Text(fmt(totalPartial)),
                       const SizedBox(height: 8),
@@ -1049,8 +1106,13 @@ class _ReportsScreenState extends State<ReportsScreen> {
                       ),
                     ],
                   ),
+                  ),
                 ),
-              ),
+              if (lines.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Center(child: Text('No data yet.')),
+                ),
               for (final l in lines)
                 Card(
                   child: ListTile(
