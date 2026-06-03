@@ -131,7 +131,7 @@ class DB {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 4,
+      version: 5,
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE timers (
@@ -217,6 +217,10 @@ class DB {
           await db.rawUpdate('UPDATE timers SET created_at_ms = COALESCE(created_at_ms, strftime("%s","now") * 1000)');
           await db.rawUpdate('UPDATE timers SET partial_adjust_sec = COALESCE(partial_adjust_sec, 0)');
           await db.rawUpdate('UPDATE timers SET total_adjust_sec = COALESCE(total_adjust_sec, 0)');
+        }
+
+        if (oldVersion < 5) {
+          await db.execute('ALTER TABLE timers ADD COLUMN pieces INTEGER NOT NULL DEFAULT 0').catchError((_) {});
         }
       },
     );
