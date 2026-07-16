@@ -1,0 +1,92 @@
+name: Flutter CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create Flutter project scaffold (if missing)
+        run: flutter create --platforms=android --project-name work_timer .
+
+      - name: Ensure Android permissions and notification receivers
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          perms = [
+            '<uses-permission android:name="android.permission.INTERNET"/>',
+            '<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>',
+            '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>',
+          ]
+          for perm in perms:
+            if perm not in s:
+              s = s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+                            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    ' + perm)
+          receivers = '''        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+                  <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+                      </intent-filter>
+                  </receiver>
+              '''
+          if 'ScheduledNotificationReceiver' not in s:
+            s = s.replace('</application>', receivers + '</application>')
+          p.write_text(s)
+          PY
+
+      - name: Enable core library desugaring (flutter_local_notifications)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          kts = Path('android/app/build.gradle.kts')
+          groovy = Path('android/app/build.gradle')
+
+          if kts.exists():
+              s = kts.read_text()
+              if 'isCoreLibraryDesugaringEnabled' not in s:
+                  s = s.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+              if 'coreLibraryDesugaring(' not in s:
+                  s += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+              kts.write_text(s)
+          elif groovy.exists():
+              s = groovy.read_text()
+              if 'coreLibraryDesugaringEnabled' not in s:
+                  s = s.replace('compileOptions {', 'compileOptions {\n        coreLibraryDesugaringEnabled true', 1)
+              if 'coreLibraryDesugaring ' not in s:
+                  s += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n}\n"
+              groovy.write_text(s)
+          else:
+              raise SystemExit('No Android Gradle file found')
+          PY
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Build debug APK
+        run: flutter build apk --debug
