@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:open_filex/open_filex.dart';
@@ -15,11 +16,14 @@ import 'package:path_provider/path_provider.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:timezone/data/latest_all.dart' as tzdata;
+import 'package:timezone/timezone.dart' as tz;
 
 import 'report_range.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Notifications.init();
   runApp(const WorkTimerApp());
 }
 
@@ -47,6 +51,15 @@ class _RootScreenState extends State<RootScreen> {
   int _index = 0;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await Notifications.requestPermission();
+      await syncTimerNotifications();
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
     final pages = [
       TimersScreen(onOpenUpdates: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const UpdatesScreen()))),
@@ -66,6 +79,145 @@ class _RootScreenState extends State<RootScreen> {
   }
 }
 
+class Notifications {
+  static final FlutterLocalNotificationsPlugin _plugin = FlutterLocalNotificationsPlugin();
+  static bool _ready = false;
+
+  static Future<void> init() async {
+    if (_ready) return;
+    try {
+      tzdata.initializeTimeZones();
+      const settings = InitializationSettings(
+        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      );
+      await _plugin.initialize(settings);
+      _ready = true;
+    } catch (_) {
+      // Notifications unavailable (e.g. unsupported platform); app still works.
+    }
+  }
+
+  static Future<void> requestPermission() async {
+    if (!_ready) return;
+    try {
+      await _plugin
+          .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+          ?.requestNotificationsPermission();
+    } catch (_) {}
+  }
+
+  static AndroidNotificationDetails _statusDetails({required bool running, int? chronometerBaseMs}) {
+    return AndroidNotificationDetails(
+      'timer_status',
+      'Timer status',
+      channelDescription: 'Shows active timers outside the app',
+      importance: Importance.low,
+      priority: Priority.low,
+      ongoing: true,
+      autoCancel: false,
+      onlyAlertOnce: true,
+      showWhen: running,
+      when: chronometerBaseMs,
+      usesChronometer: running,
+      category: AndroidNotificationCategory.stopwatch,
+      visibility: NotificationVisibility.public,
+    );
+  }
+
+  static const AndroidNotificationDetails _eventDetails = AndroidNotificationDetails(
+    'timer_events',
+    'Timer events',
+    channelDescription: 'Alerts when a timer auto-stops',
+    importance: Importance.high,
+    priority: Priority.high,
+    visibility: NotificationVisibility.public,
+  );
+
+  static Future<void> showRunning(WorkTimer t, Duration partialElapsed, {DateTime? autoStopAt}) async {
+    if (!_ready) return;
+    final base = DateTime.now().millisecondsSinceEpoch - partialElapsed.inMilliseconds;
+    final body = autoStopAt == null
+        ? 'Running • ${t.product}'
+        : 'Running • ${t.product} • auto-stop at ${fmtDateTime(autoStopAt)}';
+    await _plugin.show(
+      t.id,
+      t.name,
+      body,
+      NotificationDetails(android: _statusDetails(running: true, chronometerBaseMs: base)),
+    );
+  }
+
+  static Future<void> showPaused(WorkTimer t, Duration partialElapsed) async {
+    if (!_ready) return;
+    await _plugin.show(
+      t.id,
+      t.name,
+      'Paused • today ${fmt(partialElapsed)}',
+      NotificationDetails(android: _statusDetails(running: false)),
+    );
+  }
+
+  static Future<void> showAutoStopped(WorkTimer t, DateTime stoppedAt) async {
+    if (!_ready) return;
+    // Cancel first so any pending scheduled notification with this id is cleared too.
+    await _plugin.cancel(t.id);
+    await _plugin.show(
+      t.id,
+      t.name,
+      'Auto-stopped at ${fmtDateTime(stoppedAt)}',
+      const NotificationDetails(android: _eventDetails),
+    );
+  }
+
+  static Future<void> scheduleAutoStop(WorkTimer t, DateTime deadline) async {
+    if (!_ready) return;
+    if (!deadline.isAfter(DateTime.now())) return;
+    try {
+      await _plugin.zonedSchedule(
+        t.id,
+        t.name,
+        'Auto-stopped at ${fmtDateTime(deadline)}',
+        tz.TZDateTime.from(deadline, tz.UTC),
+        const NotificationDetails(android: _eventDetails),
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> cancelTimer(int timerId) async {
+    if (!_ready) return;
+    await _plugin.cancel(timerId);
+  }
+}
+
+/// Brings the status-bar notifications in line with the current DB state:
+/// one ongoing notification per active timer (live chronometer while running,
+/// static text while paused) plus a scheduled auto-stop alert when configured.
+Future<void> syncTimerNotifications() async {
+  final timers = await DB.getTimers();
+  for (final t in timers) {
+    if (!t.isTotalActive) continue;
+    // Clear any stale scheduled auto-stop before re-showing/re-scheduling.
+    await Notifications.cancelTimer(t.id);
+    final stats = await computeStats(t);
+    DateTime? deadline;
+    if (t.autoStopSec > 0) {
+      final startMs = await DB.getOpenTotalSessionStartMs(t.id);
+      if (startMs != null) {
+        deadline = DateTime.fromMillisecondsSinceEpoch(startMs + t.autoStopSec * 1000);
+      }
+    }
+    if (t.isPartialActive) {
+      await Notifications.showRunning(t, stats.partialToday, autoStopAt: deadline);
+    } else {
+      await Notifications.showPaused(t, stats.partialToday);
+    }
+    if (deadline != null) {
+      await Notifications.scheduleAutoStop(t, deadline);
+    }
+  }
+}
+
 class WorkTimer {
   final int id;
   final String name;
@@ -76,6 +228,7 @@ class WorkTimer {
   final int totalAdjustSec;
   final int createdAtMs;
   final int pieces;
+  final int autoStopSec;
 
   WorkTimer({
     required this.id,
@@ -87,7 +240,7 @@ class WorkTimer {
     required this.totalAdjustSec,
     required this.createdAtMs,
     required this.pieces,
-    
+    required this.autoStopSec,
   });
 
   factory WorkTimer.fromMap(Map<String, Object?> m) => WorkTimer(
@@ -101,7 +254,7 @@ class WorkTimer {
         createdAtMs: (m['created_at_ms'] as int? ?? DateTime.now().millisecondsSinceEpoch),
         pieces:
 (m['pieces'] as int? ?? 0 ),
-       
+        autoStopSec: (m['auto_stop_sec'] as int? ?? 0),
       );
 }
 
@@ -131,7 +284,7 @@ class DB {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 5,
+      version: 6,
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE timers (
@@ -143,7 +296,8 @@ class DB {
             partial_adjust_sec INTEGER NOT NULL DEFAULT 0,
             total_adjust_sec INTEGER NOT NULL DEFAULT 0,
             created_at_ms INTEGER NOT NULL,
-            pieces INTEGER NOT NULL DEFAULT 0
+            pieces INTEGER NOT NULL DEFAULT 0,
+            auto_stop_sec INTEGER NOT NULL DEFAULT 0
           )
         ''');
         await db.execute('''
@@ -222,6 +376,10 @@ class DB {
         if (oldVersion < 5) {
           await db.execute('ALTER TABLE timers ADD COLUMN pieces INTEGER NOT NULL DEFAULT 0').catchError((_) {});
         }
+
+        if (oldVersion < 6) {
+          await db.execute('ALTER TABLE timers ADD COLUMN auto_stop_sec INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+        }
       },
     );
     return _db!;
@@ -229,11 +387,65 @@ class DB {
 
   static Future<List<WorkTimer>> getTimers() async {
     final db = await database;
+    final autoStopped = await _enforceAutoStops(db);
     final rows = await db.query('timers', orderBy: 'id DESC');
-    return rows.map(WorkTimer.fromMap).toList();
+    final timers = rows.map(WorkTimer.fromMap).toList();
+    for (final stop in autoStopped) {
+      for (final t in timers) {
+        if (t.id == stop.$1) {
+          await Notifications.showAutoStopped(t, DateTime.fromMillisecondsSinceEpoch(stop.$2));
+          break;
+        }
+      }
+    }
+    return timers;
   }
 
-  static Future<int> createTimer(String name, String product) async {
+  /// Closes sessions of active timers whose auto-stop deadline has passed.
+  /// The session ends exactly at the deadline (not "now"), so recorded time
+  /// stays correct even when the app was closed in the meantime.
+  /// Returns (timerId, deadlineMs) for every timer that was stopped.
+  static Future<List<(int, int)>> _enforceAutoStops(Database db) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final rows = await db.rawQuery('''
+      SELECT t.id AS timer_id, t.auto_stop_sec AS auto_stop_sec,
+             s.id AS session_id, s.start_at_ms AS start_at_ms
+      FROM timers t
+      JOIN total_sessions s ON s.timer_id = t.id AND s.end_at_ms IS NULL
+      WHERE t.is_total_active = 1 AND t.auto_stop_sec > 0
+    ''');
+
+    final stopped = <(int, int)>[];
+    for (final r in rows) {
+      final deadline = (r['start_at_ms'] as int) + (r['auto_stop_sec'] as int) * 1000;
+      if (now < deadline) continue;
+      final timerId = r['timer_id'] as int;
+      await db.update('timers', {'is_total_active': 0, 'is_partial_active': 0}, where: 'id = ?', whereArgs: [timerId]);
+      await db.update('total_sessions', {'end_at_ms': deadline}, where: 'id = ?', whereArgs: [r['session_id']]);
+      await db.rawUpdate(
+        'UPDATE partial_segments SET end_at_ms = ? WHERE timer_id = ? AND end_at_ms IS NULL AND start_at_ms <= ?',
+        [deadline, timerId, deadline],
+      );
+      stopped.add((timerId, deadline));
+    }
+    return stopped;
+  }
+
+  static Future<int?> getOpenTotalSessionStartMs(int timerId) async {
+    final db = await database;
+    final rows = await db.query(
+      'total_sessions',
+      columns: ['start_at_ms'],
+      where: 'timer_id = ? AND end_at_ms IS NULL',
+      whereArgs: [timerId],
+      orderBy: 'start_at_ms DESC',
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['start_at_ms'] as int?;
+  }
+
+  static Future<int> createTimer(String name, String product, {int autoStopSec = 0}) async {
     final db = await database;
     return db.insert('timers', {
       'name': name.trim(),
@@ -244,6 +456,7 @@ class DB {
       'total_adjust_sec': 0,
       'created_at_ms': DateTime.now().millisecondsSinceEpoch,
       'pieces': 0,
+      'auto_stop_sec': autoStopSec,
     });
   }
 
@@ -255,14 +468,16 @@ class DB {
     int? totalAdjustSec,
     int? createdAtMs,
     int? pieces,
+    int? autoStopSec,
   }) async {
     final db = await database;
     await db.transaction((txn) async {
       final values = <String, Object?>{'name': name.trim(), 'product': product.trim()};
       if (partialAdjustSec != null) values['partial_adjust_sec'] = partialAdjustSec;
       if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
-      if (pieces != null) 
+      if (pieces != null)
 values['pieces'] = pieces;
+      if (autoStopSec != null) values['auto_stop_sec'] = autoStopSec;
       if (createdAtMs != null) {
         final firstSession = await txn.rawQuery(
           'SELECT MIN(start_at_ms) AS first_start FROM total_sessions WHERE timer_id = ?',
@@ -471,6 +686,8 @@ class _TimersScreenState extends State<TimersScreen> {
     final productCtrl = TextEditingController(text: timer?.product ?? '');
     final partialCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.partialAdjustSec)));
     final totalCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.totalAdjustSec)));
+    final autoStopCtrl = TextEditingController(
+        text: timer == null || timer.autoStopSec <= 0 ? '' : fmt(Duration(seconds: timer.autoStopSec)));
     DateTime selectedCreated = timer == null
         ? DateTime.now()
         : DateTime.fromMillisecondsSinceEpoch(timer.createdAtMs);
@@ -532,6 +749,13 @@ class _TimersScreenState extends State<TimersScreen> {
               children: [
                 TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Task name')),
                 TextField(controller: productCtrl, decoration: const InputDecoration(labelText: 'Product')),
+                TextField(
+                  controller: autoStopCtrl,
+                  decoration: InputDecoration(
+                    labelText: 'Auto-stop after (HH:MM:SS, empty = off)',
+                    suffixIcon: IconButton(onPressed: () => pickCorrection(autoStopCtrl), icon: const Icon(Icons.timer_off)),
+                  ),
+                ),
                 if (timer != null) ...[
                   const SizedBox(height: 8),
                   Row(
@@ -566,8 +790,9 @@ class _TimersScreenState extends State<TimersScreen> {
                 final n = nameCtrl.text.trim();
                 final p = productCtrl.text.trim();
                 if (n.isEmpty || p.isEmpty) return;
+                final autoStopSec = parseDurationInputToSeconds(autoStopCtrl.text);
                 if (timer == null) {
-                  await DB.createTimer(n, p);
+                  await DB.createTimer(n, p, autoStopSec: autoStopSec);
                 } else {
                   await DB.updateTimer(
                     timer.id,
@@ -576,8 +801,10 @@ class _TimersScreenState extends State<TimersScreen> {
                     partialAdjustSec: parseDurationInputToSeconds(partialCtrl.text),
                     totalAdjustSec: parseDurationInputToSeconds(totalCtrl.text),
                     createdAtMs: selectedCreated.millisecondsSinceEpoch,
+                    autoStopSec: autoStopSec,
                   );
                 }
+                await syncTimerNotifications();
                 if (mounted) {
                   Navigator.pop(ctx);
                   setState(() {});
@@ -635,6 +862,7 @@ class _TimersScreenState extends State<TimersScreen> {
     } else {
       await DB.resumePartial(t.id);
     }
+    await syncTimerNotifications();
     setState(() {});
   }
 
@@ -693,6 +921,7 @@ class _TimersScreenState extends State<TimersScreen> {
                           Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
 Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
+                          if (t.autoStopSec > 0) Text('Auto-stop after: ${fmt(Duration(seconds: t.autoStopSec))}'),
 
                           const SizedBox(height: 10),
                           Wrap(
@@ -705,6 +934,7 @@ Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
                                 onPressed: t.isTotalActive
                                     ? () async {
                                         await DB.stop(t.id);
+                                        await Notifications.cancelTimer(t.id);
                                         setState(() {});
                                       }
                                     : null,
@@ -717,6 +947,7 @@ Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
                                 onPressed: () async {
                                   await DB.stop(t.id);
                                   await DB.deleteTimer(t.id);
+                                  await Notifications.cancelTimer(t.id);
                                   setState(() {});
                                 },
                                 icon: const Icon(Icons.delete_outline),
