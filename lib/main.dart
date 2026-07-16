@@ -200,12 +200,12 @@ Future<void> syncTimerNotifications() async {
     // Clear any stale scheduled auto-stop before re-showing/re-scheduling.
     await Notifications.cancelTimer(t.id);
     final stats = await computeStats(t);
+    // Projected stop moment based on worked time; null while paused (the
+    // deadline moves with every pause, so it is rescheduled on resume).
     DateTime? deadline;
-    if (t.autoStopSec > 0) {
-      final startMs = await DB.getOpenTotalSessionStartMs(t.id);
-      if (startMs != null) {
-        deadline = DateTime.fromMillisecondsSinceEpoch(startMs + t.autoStopSec * 1000);
-      }
+    final projectedMs = await DB.getAutoStopProjectionMs(t);
+    if (projectedMs != null) {
+      deadline = DateTime.fromMillisecondsSinceEpoch(projectedMs);
     }
     if (t.isPartialActive) {
       await Notifications.showRunning(t, stats.partialToday, autoStopAt: deadline);
@@ -401,10 +401,11 @@ class DB {
     return timers;
   }
 
-  /// Closes sessions of active timers whose auto-stop deadline has passed.
-  /// The session ends exactly at the deadline (not "now"), so recorded time
-  /// stays correct even when the app was closed in the meantime.
-  /// Returns (timerId, deadlineMs) for every timer that was stopped.
+  /// Closes sessions of active timers once the *worked* time (partial
+  /// segments, i.e. excluding pauses) reaches the auto-stop limit. The
+  /// session ends exactly at the instant the limit was reached (not "now"),
+  /// so recorded time stays correct even when the app was closed meanwhile.
+  /// Returns (timerId, stoppedAtMs) for every timer that was stopped.
   static Future<List<(int, int)>> _enforceAutoStops(Database db) async {
     final now = DateTime.now().millisecondsSinceEpoch;
     final rows = await db.rawQuery('''
@@ -417,18 +418,67 @@ class DB {
 
     final stopped = <(int, int)>[];
     for (final r in rows) {
-      final deadline = (r['start_at_ms'] as int) + (r['auto_stop_sec'] as int) * 1000;
-      if (now < deadline) continue;
       final timerId = r['timer_id'] as int;
+      final limitMs = (r['auto_stop_sec'] as int) * 1000;
+      final (_, reachedAt) = await _sessionWorkedMs(db, timerId, r['start_at_ms'] as int, now, limitMs: limitMs);
+      if (reachedAt == null) continue;
       await db.update('timers', {'is_total_active': 0, 'is_partial_active': 0}, where: 'id = ?', whereArgs: [timerId]);
-      await db.update('total_sessions', {'end_at_ms': deadline}, where: 'id = ?', whereArgs: [r['session_id']]);
+      await db.update('total_sessions', {'end_at_ms': reachedAt}, where: 'id = ?', whereArgs: [r['session_id']]);
       await db.rawUpdate(
         'UPDATE partial_segments SET end_at_ms = ? WHERE timer_id = ? AND end_at_ms IS NULL AND start_at_ms <= ?',
-        [deadline, timerId, deadline],
+        [reachedAt, timerId, reachedAt],
       );
-      stopped.add((timerId, deadline));
+      stopped.add((timerId, reachedAt));
     }
     return stopped;
+  }
+
+  /// Sums the worked time (partial segments, pauses excluded) of the open
+  /// session starting at [sessionStartMs], with open segments counted up to
+  /// [nowMs]. When [limitMs] is given, also returns the exact instant the
+  /// accumulated worked time reached that limit (null if not reached).
+  static Future<(int, int?)> _sessionWorkedMs(
+    DatabaseExecutor db,
+    int timerId,
+    int sessionStartMs,
+    int nowMs, {
+    int? limitMs,
+  }) async {
+    final segs = await db.query(
+      'partial_segments',
+      columns: ['start_at_ms', 'end_at_ms'],
+      where: 'timer_id = ? AND COALESCE(end_at_ms, ?) > ?',
+      whereArgs: [timerId, nowMs, sessionStartMs],
+      orderBy: 'start_at_ms ASC',
+    );
+    var worked = 0;
+    int? reachedAt;
+    for (final s in segs) {
+      var start = s['start_at_ms'] as int;
+      if (start < sessionStartMs) start = sessionStartMs;
+      final end = (s['end_at_ms'] as int?) ?? nowMs;
+      if (end <= start) continue;
+      if (limitMs != null && reachedAt == null && worked + (end - start) >= limitMs) {
+        reachedAt = start + (limitMs - worked);
+      }
+      worked += end - start;
+    }
+    return (worked, reachedAt);
+  }
+
+  /// Projected wall-clock instant at which a running timer will hit its
+  /// worked-time auto-stop limit. Null when there is no limit, no open
+  /// session, or the timer is paused (a paused timer accumulates no worked
+  /// time, so it has no fixed deadline).
+  static Future<int?> getAutoStopProjectionMs(WorkTimer t) async {
+    if (t.autoStopSec <= 0 || !t.isTotalActive || !t.isPartialActive) return null;
+    final db = await database;
+    final startMs = await getOpenTotalSessionStartMs(t.id);
+    if (startMs == null) return null;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final (worked, _) = await _sessionWorkedMs(db, t.id, startMs, now);
+    final remaining = t.autoStopSec * 1000 - worked;
+    return remaining <= 0 ? now : now + remaining;
   }
 
   static Future<int?> getOpenTotalSessionStartMs(int timerId) async {
@@ -752,7 +802,7 @@ class _TimersScreenState extends State<TimersScreen> {
                 TextField(
                   controller: autoStopCtrl,
                   decoration: InputDecoration(
-                    labelText: 'Auto-stop after (HH:MM:SS, empty = off)',
+                    labelText: 'Auto-stop after worked time (HH:MM:SS, empty = off)',
                     suffixIcon: IconButton(onPressed: () => pickCorrection(autoStopCtrl), icon: const Icon(Icons.timer_off)),
                   ),
                 ),
@@ -921,7 +971,7 @@ class _TimersScreenState extends State<TimersScreen> {
                           Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
 Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
-                          if (t.autoStopSec > 0) Text('Auto-stop after: ${fmt(Duration(seconds: t.autoStopSec))}'),
+                          if (t.autoStopSec > 0) Text('Auto-stop after ${fmt(Duration(seconds: t.autoStopSec))} worked time'),
 
                           const SizedBox(height: 10),
                           Wrap(
