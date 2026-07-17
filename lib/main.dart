@@ -649,6 +649,10 @@ String fmt(Duration d) {
   return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
 }
 
+/// Like [fmt] but keeps a leading '-' for negative durations
+/// (fmt itself garbles them because each unit is negative).
+String fmtSigned(Duration d) => d.isNegative ? '-${fmt(-d)}' : fmt(d);
+
 String fmtDateTime(DateTime dt) {
   final y = dt.year.toString().padLeft(4, '0');
   final mo = dt.month.toString().padLeft(2, '0');
@@ -659,14 +663,22 @@ String fmtDateTime(DateTime dt) {
 }
 
 int parseDurationInputToSeconds(String input) {
-  final v = input.trim();
+  var v = input.trim();
+  if (v.isEmpty) return 0;
+  var sign = 1;
+  if (v.startsWith('-')) {
+    sign = -1;
+    v = v.substring(1).trim();
+  } else if (v.startsWith('+')) {
+    v = v.substring(1).trim();
+  }
   if (v.isEmpty) return 0;
   if (v.contains(':')) {
     final parts = v.split(':').map((e) => int.tryParse(e) ?? 0).toList();
-    if (parts.length == 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    if (parts.length == 2) return parts[0] * 60 + parts[1];
+    if (parts.length == 3) return sign * (parts[0] * 3600 + parts[1] * 60 + parts[2]);
+    if (parts.length == 2) return sign * (parts[0] * 60 + parts[1]);
   }
-  return int.tryParse(v) ?? 0;
+  return sign * (int.tryParse(v) ?? 0);
 }
 
 class TimerStats {
@@ -734,8 +746,8 @@ class _TimersScreenState extends State<TimersScreen> {
   Future<void> _timerDialog({WorkTimer? timer}) async {
     final nameCtrl = TextEditingController(text: timer?.name ?? '');
     final productCtrl = TextEditingController(text: timer?.product ?? '');
-    final partialCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.partialAdjustSec)));
-    final totalCtrl = TextEditingController(text: timer == null ? '0' : fmt(Duration(seconds: timer.totalAdjustSec)));
+    final partialCtrl = TextEditingController(text: timer == null ? '0' : fmtSigned(Duration(seconds: timer.partialAdjustSec)));
+    final totalCtrl = TextEditingController(text: timer == null ? '0' : fmtSigned(Duration(seconds: timer.totalAdjustSec)));
     final autoStopCtrl = TextEditingController(
         text: timer == null || timer.autoStopSec <= 0 ? '' : fmt(Duration(seconds: timer.autoStopSec)));
     DateTime selectedCreated = timer == null
@@ -778,14 +790,41 @@ class _TimersScreenState extends State<TimersScreen> {
       }
     }
 
-    Future<void> pickCorrection(TextEditingController ctrl) async {
+    Future<void> pickCorrection(TextEditingController ctrl, {bool keepSign = false}) async {
+      final negative = keepSign && ctrl.text.trim().startsWith('-');
       final picked = await showTimePicker(
         context: context,
         initialTime: const TimeOfDay(hour: 0, minute: 0),
       );
       if (picked != null) {
-        ctrl.text = '${picked.hour.toString().padLeft(2, '0')}:${picked.minute.toString().padLeft(2, '0')}:00';
+        ctrl.text = '${negative ? '-' : ''}${picked.hour.toString().padLeft(2, '0')}:${picked.minute.toString().padLeft(2, '0')}:00';
       }
+    }
+
+    void toggleSign(TextEditingController ctrl, StateSetter setLocal) {
+      var t = ctrl.text.trim();
+      if (t.startsWith('-')) {
+        t = t.substring(1).trim();
+      } else if (parseDurationInputToSeconds(t) != 0) {
+        t = '-${t.startsWith('+') ? t.substring(1).trim() : t}';
+      }
+      ctrl.text = t;
+      setLocal(() {});
+    }
+
+    Widget correctionSuffix(TextEditingController ctrl, StateSetter setLocal) {
+      final negative = ctrl.text.trim().startsWith('-');
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: negative ? 'Subtracting — tap to add instead' : 'Adding — tap to subtract instead',
+            onPressed: () => toggleSign(ctrl, setLocal),
+            icon: Icon(negative ? Icons.remove_circle_outline : Icons.add_circle_outline),
+          ),
+          IconButton(onPressed: () => pickCorrection(ctrl, keepSign: true), icon: const Icon(Icons.schedule)),
+        ],
+      );
     }
 
     await showDialog(
@@ -817,16 +856,18 @@ class _TimersScreenState extends State<TimersScreen> {
                   ),
                   TextField(
                     controller: partialCtrl,
+                    onChanged: (_) => setLocal(() {}),
                     decoration: InputDecoration(
-                      labelText: 'Partial correction (HH:MM:SS or seconds)',
-                      suffixIcon: IconButton(onPressed: () => pickCorrection(partialCtrl), icon: const Icon(Icons.schedule)),
+                      labelText: 'Partial correction (±HH:MM:SS or seconds)',
+                      suffixIcon: correctionSuffix(partialCtrl, setLocal),
                     ),
                   ),
                   TextField(
                     controller: totalCtrl,
+                    onChanged: (_) => setLocal(() {}),
                     decoration: InputDecoration(
-                      labelText: 'Total correction (HH:MM:SS or seconds)',
-                      suffixIcon: IconButton(onPressed: () => pickCorrection(totalCtrl), icon: const Icon(Icons.schedule)),
+                      labelText: 'Total correction (±HH:MM:SS or seconds)',
+                      suffixIcon: correctionSuffix(totalCtrl, setLocal),
                     ),
                   ),
                 ],
