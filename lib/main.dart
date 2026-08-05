@@ -280,13 +280,28 @@ class Segment {
 
 class DB {
   static Database? _db;
+  static Future<Database>? _opening;
 
-  static Future<Database> get database async {
-    if (_db != null) return _db!;
+  /// Single-flight database handle. Several screens hit this concurrently on
+  /// the first frame; without the [_opening] guard each of them would start
+  /// its own [openDatabase] and run the migrations in parallel.
+  static Future<Database> get database {
+    final existing = _db;
+    if (existing != null) return Future<Database>.value(existing);
+    return _opening ??= _open().whenComplete(() => _opening = null);
+  }
+
+  static Future<Database> _open() async {
     final dbPath = await getDatabasesPath();
-    _db = await openDatabase(
+    final db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
       version: 7,
+      onConfigure: (db) async {
+        // Must happen outside a transaction, which is why it lives here and
+        // not in onCreate/onUpgrade. Without it the ON DELETE CASCADE
+        // constraints below are silently inert.
+        await db.execute('PRAGMA foreign_keys = ON');
+      },
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE timers (
@@ -356,8 +371,14 @@ class DB {
         if (oldVersion < 3) {
           final tables = await db.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND name='time_entries'");
           if (tables.isNotEmpty) {
+            // Foreign keys are enforced now, so an entry pointing at a
+            // deleted timer would abort the whole upgrade. Skip those.
+            final liveTimerIds = {
+              for (final r in await db.query('timers', columns: ['id'])) r['id'] as int,
+            };
             final oldEntries = await db.query('time_entries');
             for (final e in oldEntries) {
+              if (!liveTimerIds.contains(e['timer_id'] as int?)) continue;
               final start = DateTime.parse(e['started_at'] as String).millisecondsSinceEpoch;
               final endRaw = e['ended_at'] as String?;
               final end = endRaw == null ? null : DateTime.parse(endRaw).millisecondsSinceEpoch;
@@ -399,7 +420,8 @@ class DB {
         }
       },
     );
-    return _db!;
+    _db = db;
+    return db;
   }
 
   static Future<List<WorkTimer>> getTimers() async {
@@ -441,9 +463,16 @@ class DB {
       if (reachedAt == null) continue;
       await db.update('timers', {'is_total_active': 0, 'is_partial_active': 0}, where: 'id = ?', whereArgs: [timerId]);
       await db.update('total_sessions', {'end_at_ms': reachedAt}, where: 'id = ?', whereArgs: [r['session_id']]);
+      // Trim every segment that extends past the limit, not just those
+      // starting before it. An open segment that started later would
+      // otherwise stay open forever on a timer that is no longer active and
+      // keep counting up to "now"; a closed one would record worked time past
+      // the point where the session already ended. MAX() collapses a segment
+      // that begins after the limit to zero length.
       await db.rawUpdate(
-        'UPDATE partial_segments SET end_at_ms = ? WHERE timer_id = ? AND end_at_ms IS NULL AND start_at_ms <= ?',
-        [reachedAt, timerId, reachedAt],
+        'UPDATE partial_segments SET end_at_ms = MAX(start_at_ms, ?) '
+        'WHERE timer_id = ? AND COALESCE(end_at_ms, ?) > ?',
+        [reachedAt, timerId, now, reachedAt],
       );
       stopped.add((timerId, reachedAt));
     }
@@ -573,49 +602,68 @@ values['pieces'] = pieces;
     await db.delete('timers', where: 'id = ?', whereArgs: [id]);
   }
 
+  /// Opens a partial segment unless one is already open. Reusing an open
+  /// segment keeps start/resume idempotent: two of them in flight at once
+  /// (double tap, or a stale `is_partial_active` in the UI snapshot) would
+  /// otherwise leave two open segments, and today's time would run at 2x.
+  static Future<void> _openPartialSegment(DatabaseExecutor txn, int timerId, int nowMs) async {
+    final open = await txn.query('partial_segments',
+        columns: ['id'], where: 'timer_id = ? AND end_at_ms IS NULL', whereArgs: [timerId], limit: 1);
+    if (open.isNotEmpty) return;
+    await txn.insert('partial_segments', {'timer_id': timerId, 'start_at_ms': nowMs, 'end_at_ms': null});
+  }
+
+  /// Closes every open segment/session of a timer, so a leaked row from an
+  /// earlier version cannot keep accumulating time after the timer stopped.
+  static Future<void> _closeOpenRows(DatabaseExecutor txn, String table, int timerId, int nowMs) async {
+    await txn.rawUpdate(
+      'UPDATE $table SET end_at_ms = MAX(start_at_ms, ?) WHERE timer_id = ? AND end_at_ms IS NULL',
+      [nowMs, timerId],
+    );
+  }
+
   static Future<void> start(int timerId) async {
     final db = await database;
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    await db.update('timers', {'is_total_active': 1, 'is_partial_active': 1}, where: 'id = ?', whereArgs: [timerId]);
-    await db.insert('total_sessions', {'timer_id': timerId, 'start_at_ms': now, 'end_at_ms': null});
-    await db.insert('partial_segments', {'timer_id': timerId, 'start_at_ms': now, 'end_at_ms': null});
+    await db.transaction((txn) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final openSession = await txn.query('total_sessions',
+          columns: ['id'], where: 'timer_id = ? AND end_at_ms IS NULL', whereArgs: [timerId], limit: 1);
+      if (openSession.isEmpty) {
+        await txn.insert('total_sessions', {'timer_id': timerId, 'start_at_ms': now, 'end_at_ms': null});
+      }
+      await _openPartialSegment(txn, timerId, now);
+      await txn.update('timers', {'is_total_active': 1, 'is_partial_active': 1},
+          where: 'id = ?', whereArgs: [timerId]);
+    });
   }
 
   static Future<void> pausePartial(int timerId) async {
     final db = await database;
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    await db.update('timers', {'is_partial_active': 0}, where: 'id = ?', whereArgs: [timerId]);
-    final openSeg = await db.query('partial_segments', where: 'timer_id = ? AND end_at_ms IS NULL', whereArgs: [timerId], orderBy: 'start_at_ms DESC', limit: 1);
-    if (openSeg.isNotEmpty) {
-      await db.update('partial_segments', {'end_at_ms': now}, where: 'id = ?', whereArgs: [openSeg.first['id']]);
-    }
+    await db.transaction((txn) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await _closeOpenRows(txn, 'partial_segments', timerId, now);
+      await txn.update('timers', {'is_partial_active': 0}, where: 'id = ?', whereArgs: [timerId]);
+    });
   }
 
   static Future<void> resumePartial(int timerId) async {
     final db = await database;
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    await db.update('timers', {'is_partial_active': 1}, where: 'id = ?', whereArgs: [timerId]);
-    await db.insert('partial_segments', {'timer_id': timerId, 'start_at_ms': now, 'end_at_ms': null});
+    await db.transaction((txn) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await _openPartialSegment(txn, timerId, now);
+      await txn.update('timers', {'is_partial_active': 1}, where: 'id = ?', whereArgs: [timerId]);
+    });
   }
 
   static Future<void> stop(int timerId) async {
     final db = await database;
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    await db.update('timers', {'is_total_active': 0, 'is_partial_active': 0}, where: 'id = ?', whereArgs: [timerId]);
-
-    final openPartial = await db.query('partial_segments', where: 'timer_id = ? AND end_at_ms IS NULL', whereArgs: [timerId], orderBy: 'start_at_ms DESC', limit: 1);
-    if (openPartial.isNotEmpty) {
-      await db.update('partial_segments', {'end_at_ms': now}, where: 'id = ?', whereArgs: [openPartial.first['id']]);
-    }
-
-    final openTotal = await db.query('total_sessions', where: 'timer_id = ? AND end_at_ms IS NULL', whereArgs: [timerId], orderBy: 'start_at_ms DESC', limit: 1);
-    if (openTotal.isNotEmpty) {
-      await db.update('total_sessions', {'end_at_ms': now}, where: 'id = ?', whereArgs: [openTotal.first['id']]);
-    }
+    await db.transaction((txn) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await _closeOpenRows(txn, 'partial_segments', timerId, now);
+      await _closeOpenRows(txn, 'total_sessions', timerId, now);
+      await txn.update('timers', {'is_total_active': 0, 'is_partial_active': 0},
+          where: 'id = ?', whereArgs: [timerId]);
+    });
   }
 
   static Future<List<Segment>> getPartialSegmentsForTimer(int timerId) async {
@@ -657,16 +705,31 @@ values['pieces'] = pieces;
   }) async {
     final db = await database;
     await db.transaction((txn) async {
+      final row = await txn.query('total_sessions',
+          columns: ['end_at_ms'], where: 'id = ?', whereArgs: [totalSessionId], limit: 1);
+      if (row.isEmpty) return;
+      final wasRunning = row.first['end_at_ms'] == null;
+
       await txn.delete('total_sessions', where: 'id = ?', whereArgs: [totalSessionId]);
+      // An open segment belongs to this session too, so treat its end as the
+      // session end instead of its own start (which would exclude it).
       await txn.rawDelete(
         '''
         DELETE FROM partial_segments
         WHERE timer_id = ?
           AND start_at_ms >= ?
-          AND COALESCE(end_at_ms, start_at_ms) <= ?
+          AND COALESCE(end_at_ms, ?) <= ?
         ''',
-        [timerId, sessionStartMs, sessionEndMs],
+        [timerId, sessionStartMs, sessionEndMs, sessionEndMs],
       );
+
+      // Deleting the session that is currently running would otherwise leave
+      // the timer flagged active with nothing open to record into: the card
+      // keeps showing "Running" and no button but Stop can recover it.
+      if (wasRunning) {
+        await txn.update('timers', {'is_total_active': 0, 'is_partial_active': 0},
+            where: 'id = ?', whereArgs: [timerId]);
+      }
     });
   }
 }
@@ -696,10 +759,23 @@ String fmtBalance(Duration d) => d.isNegative ? '-${fmt(-d)}' : '+${fmt(d)}';
 DateTime weekStartOf(DateTime d) =>
     DateTime(d.year, d.month, d.day).subtract(Duration(days: d.weekday - 1));
 
-/// Parses a weekly work-time target. Hours-first, unlike
-/// [parseDurationInputToSeconds]: '40' = 40h, '38.5'/'38,5' = 38h30m,
-/// '38:30' = 38h30m, '38:30:15' = HH:MM:SS.
-int parseWeeklyTargetToSeconds(String input) {
+/// ISO-8601 week number (1..53) of the week containing [date].
+///
+/// The week is numbered by the calendar year its Thursday falls in. Counting
+/// with calendar fields and a UTC day difference (rather than [Duration] on
+/// local dates) keeps this exact across DST changes, where a local "day" is
+/// 23 or 25 hours long and truncating to whole days loses one.
+int isoWeekNumber(DateTime date) {
+  final thursday = DateTime(date.year, date.month, date.day + (4 - date.weekday));
+  final jan1 = DateTime.utc(thursday.year, 1, 1);
+  final thursdayUtc = DateTime.utc(thursday.year, thursday.month, thursday.day);
+  return thursdayUtc.difference(jan1).inDays ~/ 7 + 1;
+}
+
+/// Parses an hours-first work-time input, unlike [parseDurationInputToSeconds]
+/// (which reads bare numbers as seconds and 'MM:SS'): '40' = 40h,
+/// '38.5'/'38,5' = 38h30m, '38:30' = 38h30m, '38:30:15' = HH:MM:SS.
+int parseHoursFirstDurationToSeconds(String input) {
   final v = input.trim().replaceAll(',', '.');
   if (v.isEmpty) return 0;
   if (v.contains(':')) {
@@ -710,6 +786,18 @@ int parseWeeklyTargetToSeconds(String input) {
   }
   final hours = double.tryParse(v) ?? 0;
   return (hours * 3600).round();
+}
+
+/// Parses a weekly work-time target. See [parseHoursFirstDurationToSeconds].
+int parseWeeklyTargetToSeconds(String input) => parseHoursFirstDurationToSeconds(input);
+
+/// Parses an auto-stop limit. Hours-first like the weekly target — the field
+/// is prefilled as HH:MM:SS, so reading a bare '8' as eight *seconds* (what
+/// [parseDurationInputToSeconds] does) would silently kill sessions on start.
+/// Negative input means "off".
+int parseAutoStopToSeconds(String input) {
+  final seconds = parseHoursFirstDurationToSeconds(input);
+  return seconds < 0 ? 0 : seconds;
 }
 
 String fmtDateTime(DateTime dt) {
@@ -821,12 +909,17 @@ class _TimersScreenState extends State<TimersScreen> {
         lastDate: DateTime(2100),
       );
       if (picked != null) {
+        // Keep seconds/ms: dropping them would make "created" differ from the
+        // stored value by up to a minute even when the date was not changed,
+        // and updateTimer shifts every session by exactly that difference.
         selectedCreated = DateTime(
           picked.year,
           picked.month,
           picked.day,
           selectedCreated.hour,
           selectedCreated.minute,
+          selectedCreated.second,
+          selectedCreated.millisecond,
         );
         setLocal(() {});
       }
@@ -844,6 +937,8 @@ class _TimersScreenState extends State<TimersScreen> {
           selectedCreated.day,
           picked.hour,
           picked.minute,
+          selectedCreated.second,
+          selectedCreated.millisecond,
         );
         setLocal(() {});
       }
@@ -899,8 +994,9 @@ class _TimersScreenState extends State<TimersScreen> {
                 TextField(controller: productCtrl, decoration: const InputDecoration(labelText: 'Product')),
                 TextField(
                   controller: autoStopCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
                   decoration: InputDecoration(
-                    labelText: 'Auto-stop after worked time (HH:MM:SS, empty = off)',
+                    labelText: 'Auto-stop after worked time (hours: 8, 7.5 or 08:30 — empty = off)',
                     suffixIcon: IconButton(onPressed: () => pickCorrection(autoStopCtrl), icon: const Icon(Icons.timer_off)),
                   ),
                 ),
@@ -940,7 +1036,7 @@ class _TimersScreenState extends State<TimersScreen> {
                 final n = nameCtrl.text.trim();
                 final p = productCtrl.text.trim();
                 if (n.isEmpty || p.isEmpty) return;
-                final autoStopSec = parseDurationInputToSeconds(autoStopCtrl.text);
+                final autoStopSec = parseAutoStopToSeconds(autoStopCtrl.text);
                 if (timer == null) {
                   await DB.createTimer(n, p, autoStopSec: autoStopSec);
                 } else {
@@ -1483,12 +1579,6 @@ class _ReportsScreenState extends State<ReportsScreen> {
 
   DateTime _weekStart(DateTime d) => weekStartOf(d);
 
-  int _isoWeek(DateTime d) {
-    final thursday = d.add(Duration(days: 4 - d.weekday));
-    final firstJan = DateTime(thursday.year, 1, 1);
-    return ((thursday.difference(firstJan).inDays) / 7).floor() + 1;
-  }
-
   String _safeName(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '-').replaceAll(RegExp(r'-+'), '-').replaceAll(RegExp(r'^-|-$'), '');
 
   String _pdfFileName(List<ReportLine> lines) {
@@ -1524,7 +1614,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
       for (final wk in keys) {
         final block = grouped[wk]!;
         final weekTotal = block.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
-        final kw = _isoWeek(wk);
+        final kw = isoWeekNumber(wk);
         widgets.add(pw.Text('KW $kw • Woche ab ${fmtDateTime(wk).split(' ').first}', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)));
         widgets.add(
           pw.Table.fromTextArray(
@@ -1735,6 +1825,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
                               sessionStartMs: l.start.millisecondsSinceEpoch,
                               sessionEndMs: l.end.millisecondsSinceEpoch,
                             );
+                            // The session may have been the running one, in
+                            // which case its ongoing notification is now stale.
+                            await Notifications.cancelTimer(l.timer.id);
+                            await syncTimerNotifications();
                             if (mounted) setState(() {});
                           },
                         ),

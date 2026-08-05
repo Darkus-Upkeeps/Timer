@@ -34,6 +34,29 @@ void main() {
     expect(parseWeeklyTargetToSeconds('abc'), 0);
   });
 
+  test('auto-stop input is read hours-first, not seconds-first', () {
+    // The field is prefilled as HH:MM:SS, so a bare '8' means eight hours.
+    // Reading it as eight seconds (parseDurationInputToSeconds) auto-stopped
+    // the session moments after it started.
+    expect(parseAutoStopToSeconds('8'), 8 * 3600);
+    expect(parseAutoStopToSeconds('7.5'), 7 * 3600 + 1800);
+    expect(parseAutoStopToSeconds('7,5'), 7 * 3600 + 1800);
+    expect(parseAutoStopToSeconds('08:30'), 8 * 3600 + 1800);
+    expect(parseAutoStopToSeconds('08:30:15'), 8 * 3600 + 1815);
+  });
+
+  test('auto-stop input round-trips through the field prefill', () {
+    for (final seconds in [8 * 3600, 30 * 60, 12 * 3600 + 1815]) {
+      expect(parseAutoStopToSeconds(fmt(Duration(seconds: seconds))), seconds);
+    }
+  });
+
+  test('auto-stop treats empty and negative input as off', () {
+    expect(parseAutoStopToSeconds(''), 0);
+    expect(parseAutoStopToSeconds('abc'), 0);
+    expect(parseAutoStopToSeconds('-4'), 0);
+  });
+
   test('fmtBalance always renders an explicit sign', () {
     expect(fmtBalance(const Duration(hours: 2, minutes: 15)), '+02:15:00');
     expect(fmtBalance(const Duration(hours: -1, minutes: -30)), '-01:30:00');
