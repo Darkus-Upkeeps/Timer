@@ -64,6 +64,7 @@ class _RootScreenState extends State<RootScreen> {
     final pages = [
       TimersScreen(onOpenUpdates: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const UpdatesScreen()))),
       const ReportsScreen(),
+      const DashboardScreen(),
     ];
     return Scaffold(
       body: pages[_index],
@@ -73,6 +74,7 @@ class _RootScreenState extends State<RootScreen> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.timer), label: 'Timers'),
           NavigationDestination(icon: Icon(Icons.analytics), label: 'Reports'),
+          NavigationDestination(icon: Icon(Icons.dashboard), label: 'Dashboard'),
         ],
       ),
     );
@@ -284,7 +286,7 @@ class DB {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 6,
+      version: 7,
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE timers (
@@ -316,6 +318,12 @@ class DB {
             start_at_ms INTEGER NOT NULL,
             end_at_ms INTEGER,
             FOREIGN KEY(timer_id) REFERENCES timers(id) ON DELETE CASCADE
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
           )
         ''');
       },
@@ -379,6 +387,15 @@ class DB {
 
         if (oldVersion < 6) {
           await db.execute('ALTER TABLE timers ADD COLUMN auto_stop_sec INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+        }
+
+        if (oldVersion < 7) {
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+          ''');
         }
       },
     );
@@ -529,13 +546,13 @@ class DB {
 values['pieces'] = pieces;
       if (autoStopSec != null) values['auto_stop_sec'] = autoStopSec;
       if (createdAtMs != null) {
-        final firstSession = await txn.rawQuery(
-          'SELECT MIN(start_at_ms) AS first_start FROM total_sessions WHERE timer_id = ?',
-          [id],
-        );
-      
-        final firstStart = (firstSession.first['first_start'] as int?) ?? createdAtMs;
-        final delta = createdAtMs - firstStart;
+        // Shift recorded time only by how much the created date actually
+        // changed. Anchoring on the first session start instead moved all
+        // sessions on every save, even when the date was left untouched.
+        final row = await txn.query('timers',
+            columns: ['created_at_ms'], where: 'id = ?', whereArgs: [id], limit: 1);
+        final oldCreatedAtMs = row.isEmpty ? null : row.first['created_at_ms'] as int?;
+        final delta = oldCreatedAtMs == null ? 0 : createdAtMs - oldCreatedAtMs;
 
         if (delta != 0) {
           await txn.rawUpdate('UPDATE total_sessions SET start_at_ms = start_at_ms + ?, end_at_ms = CASE WHEN end_at_ms IS NULL THEN NULL ELSE end_at_ms + ? END WHERE timer_id = ?', [delta, delta, id]);
@@ -613,6 +630,25 @@ values['pieces'] = pieces;
     return rows.map(Segment.fromMap).toList();
   }
 
+  static const _weeklyTargetKey = 'weekly_target_sec';
+
+  static Future<int> getWeeklyTargetSec() async {
+    final db = await database;
+    final rows = await db.query('settings',
+        columns: ['value'], where: 'key = ?', whereArgs: [_weeklyTargetKey], limit: 1);
+    if (rows.isEmpty) return 0;
+    return int.tryParse(rows.first['value'] as String) ?? 0;
+  }
+
+  static Future<void> setWeeklyTargetSec(int seconds) async {
+    final db = await database;
+    await db.insert(
+      'settings',
+      {'key': _weeklyTargetKey, 'value': seconds.toString()},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
   static Future<void> deleteReportEntry({
     required int timerId,
     required int totalSessionId,
@@ -652,6 +688,29 @@ String fmt(Duration d) {
 /// Like [fmt] but keeps a leading '-' for negative durations
 /// (fmt itself garbles them because each unit is negative).
 String fmtSigned(Duration d) => d.isNegative ? '-${fmt(-d)}' : fmt(d);
+
+/// Formats a plus/minus balance with an explicit sign: '+01:30:00' / '-01:30:00'.
+String fmtBalance(Duration d) => d.isNegative ? '-${fmt(-d)}' : '+${fmt(d)}';
+
+/// Monday 00:00 of the week containing [d].
+DateTime weekStartOf(DateTime d) =>
+    DateTime(d.year, d.month, d.day).subtract(Duration(days: d.weekday - 1));
+
+/// Parses a weekly work-time target. Hours-first, unlike
+/// [parseDurationInputToSeconds]: '40' = 40h, '38.5'/'38,5' = 38h30m,
+/// '38:30' = 38h30m, '38:30:15' = HH:MM:SS.
+int parseWeeklyTargetToSeconds(String input) {
+  final v = input.trim().replaceAll(',', '.');
+  if (v.isEmpty) return 0;
+  if (v.contains(':')) {
+    final parts = v.split(':').map((e) => int.tryParse(e.trim()) ?? 0).toList();
+    if (parts.length == 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length == 2) return parts[0] * 3600 + parts[1] * 60;
+    return 0;
+  }
+  final hours = double.tryParse(v) ?? 0;
+  return (hours * 3600).round();
+}
 
 String fmtDateTime(DateTime dt) {
   final y = dt.year.toString().padLeft(4, '0');
@@ -1103,6 +1162,262 @@ class ReportLine {
   }
 }
 
+Future<List<ReportLine>> buildReportLines(DateTime rangeStart, DateTime rangeEnd) async {
+  final timers = await DB.getTimers();
+  final timerById = {for (final t in timers) t.id: t};
+
+  final lines = <ReportLine>[];
+  for (final t in timers) {
+    final totals = await DB.getTotalSessionsForTimer(t.id);
+    final partials = await DB.getPartialSegmentsForTimer(t.id);
+
+    for (final session in totals) {
+      final rawEnd = session.endAt ?? DateTime.now();
+      final sessionTotal = overlapDuration(
+        rangeStart: rangeStart,
+        rangeEnd: rangeEnd,
+        segStart: session.startAt,
+        segEnd: rawEnd,
+      );
+      if (sessionTotal == Duration.zero) continue;
+
+      Duration partialInSession = Duration.zero;
+      for (final pseg in partials) {
+        final pend = pseg.endAt ?? DateTime.now();
+        partialInSession += overlapDuration(
+          rangeStart: rangeStart,
+          rangeEnd: rangeEnd,
+          segStart: pseg.startAt.isAfter(session.startAt) ? pseg.startAt : session.startAt,
+          segEnd: pend.isBefore(rawEnd) ? pend : rawEnd,
+        );
+      }
+      if (partialInSession > sessionTotal) partialInSession = sessionTotal;
+
+      final pause = (sessionTotal - partialInSession).inMinutes;
+      final timer = timerById[session.timerId];
+      if (timer == null) continue;
+
+      lines.add(ReportLine(
+        timer: timer,
+        totalSessionId: session.id,
+        start: session.startAt,
+        end: rawEnd,
+        partial: partialInSession,
+        total: sessionTotal,
+        pauseMinutes: pause,
+      ));
+    }
+  }
+
+  // Apply timer-level corrections so reports stay in sync with edit values.
+  final byTimer = <int, List<int>>{};
+  for (var i = 0; i < lines.length; i++) {
+    byTimer.putIfAbsent(lines[i].timer.id, () => []).add(i);
+  }
+
+  for (final t in timers) {
+    final idxs = byTimer[t.id] ?? const <int>[];
+    if (idxs.isEmpty) continue;
+    var line = lines[idxs.first];
+
+    if (t.partialAdjustSec != 0) {
+      var newPartial = line.partial + Duration(seconds: t.partialAdjustSec);
+      if (newPartial.isNegative) newPartial = Duration.zero;
+      final newPause = (line.total - newPartial).inMinutes < 0 ? 0 : (line.total - newPartial).inMinutes;
+      line = line.copyWith(partial: newPartial, pauseMinutes: newPause);
+    }
+
+    if (t.totalAdjustSec != 0) {
+      var newTotal = line.total + Duration(seconds: t.totalAdjustSec);
+      if (newTotal.isNegative) newTotal = Duration.zero;
+      final newPause = (newTotal - line.partial).inMinutes < 0 ? 0 : (newTotal - line.partial).inMinutes;
+      line = line.copyWith(total: newTotal, pauseMinutes: newPause);
+    }
+
+    lines[idxs.first] = line;
+  }
+
+  lines.sort((a, b) => a.start.compareTo(b.start));
+  return lines;
+}
+
+/// Worked time per week (Monday-keyed) summed from report lines.
+Map<DateTime, Duration> workedPerWeek(List<ReportLine> lines) {
+  final byWeek = <DateTime, Duration>{};
+  for (final l in lines) {
+    final wk = weekStartOf(l.start);
+    byWeek[wk] = (byWeek[wk] ?? Duration.zero) + l.partial;
+  }
+  return byWeek;
+}
+
+class _DashboardData {
+  final List<WorkTimer> activeTimers;
+  final Map<int, TimerStats> activeStats;
+  final int weeklyTargetSec;
+  final Duration workedThisWeek;
+
+  _DashboardData({
+    required this.activeTimers,
+    required this.activeStats,
+    required this.weeklyTargetSec,
+    required this.workedThisWeek,
+  });
+}
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  late Timer _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker.cancel();
+    super.dispose();
+  }
+
+  Future<_DashboardData> _load() async {
+    final timers = await DB.getTimers();
+    final active = timers.where((t) => t.isTotalActive).toList();
+    final activeStats = <int, TimerStats>{};
+    for (final t in active) {
+      activeStats[t.id] = await computeStats(t);
+    }
+    final targetSec = await DB.getWeeklyTargetSec();
+    final now = DateTime.now();
+    final lines = await buildReportLines(weekStartOf(now), now);
+    final worked = lines.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
+    return _DashboardData(
+      activeTimers: active,
+      activeStats: activeStats,
+      weeklyTargetSec: targetSec,
+      workedThisWeek: worked,
+    );
+  }
+
+  Future<void> _editWeeklyTarget(int currentSec) async {
+    final ctrl = TextEditingController(
+      text: currentSec <= 0
+          ? ''
+          : '${currentSec ~/ 3600}:${((currentSec % 3600) ~/ 60).toString().padLeft(2, '0')}',
+    );
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Wochenstunden (Soll)'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(
+            labelText: 'Stunden pro Woche (z.B. 40, 38,5 oder 38:30)',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              await DB.setWeeklyTargetSec(parseWeeklyTargetToSeconds(ctrl.text));
+              if (mounted) {
+                Navigator.pop(ctx);
+                setState(() {});
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Dashboard')),
+      body: FutureBuilder<_DashboardData>(
+        future: _load(),
+        builder: (context, snap) {
+          if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+          final data = snap.data!;
+          final target = Duration(seconds: data.weeklyTargetSec);
+          final balance = data.workedThisWeek - target;
+
+          return ListView(
+            padding: const EdgeInsets.all(12),
+            children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text('Diese Woche', style: Theme.of(context).textTheme.titleMedium),
+                          ),
+                          IconButton(
+                            tooltip: 'Wochenstunden festlegen',
+                            onPressed: () => _editWeeklyTarget(data.weeklyTargetSec),
+                            icon: const Icon(Icons.edit),
+                          ),
+                        ],
+                      ),
+                      Text('Gearbeitet: ${fmt(data.workedThisWeek)}'),
+                      if (data.weeklyTargetSec > 0) ...[
+                        Text('Soll: ${fmt(target)}'),
+                        Text(
+                          '${balance.isNegative ? 'Minusstunden' : 'Plusstunden'}: ${fmtBalance(balance)}',
+                          style: TextStyle(
+                            color: balance.isNegative ? Colors.red : Colors.green,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ] else
+                        const Text('Keine Wochenstunden hinterlegt — mit dem Stift festlegen, um Plus-/Minusstunden zu sehen.'),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text('Aktive Timer', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 4),
+              if (data.activeTimers.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Center(child: Text('Kein Timer läuft gerade.')),
+                ),
+              for (final t in data.activeTimers)
+                Card(
+                  child: ListTile(
+                    leading: Icon(Icons.circle, size: 14, color: t.isPartialActive ? Colors.green : Colors.orange),
+                    title: Text('${t.name} • ${t.product}'),
+                    subtitle: Text(t.isPartialActive ? 'Running' : 'Paused'),
+                    trailing: Text(
+                      fmt(data.activeStats[t.id]?.partialToday ?? Duration.zero),
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                  ),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
 class ReportsScreen extends StatefulWidget {
   const ReportsScreen({super.key});
 
@@ -1158,86 +1473,15 @@ class _ReportsScreenState extends State<ReportsScreen> {
   }
 
   Future<List<ReportLine>> _buildReportLines() async {
-    final timers = await DB.getTimers();
-    final timerById = {for (final t in timers) t.id: t};
     final (rangeStart, rangeEnd) = _rangeNow();
-
-    final lines = <ReportLine>[];
-    for (final t in timers) {
-      final totals = await DB.getTotalSessionsForTimer(t.id);
-      final partials = await DB.getPartialSegmentsForTimer(t.id);
-
-      for (final session in totals) {
-        final rawEnd = session.endAt ?? DateTime.now();
-        final sessionTotal = overlapDuration(
-          rangeStart: rangeStart,
-          rangeEnd: rangeEnd,
-          segStart: session.startAt,
-          segEnd: rawEnd,
-        );
-        if (sessionTotal == Duration.zero) continue;
-
-        Duration partialInSession = Duration.zero;
-        for (final pseg in partials) {
-          final pend = pseg.endAt ?? DateTime.now();
-          partialInSession += overlapDuration(
-            rangeStart: rangeStart,
-            rangeEnd: rangeEnd,
-            segStart: pseg.startAt.isAfter(session.startAt) ? pseg.startAt : session.startAt,
-            segEnd: pend.isBefore(rawEnd) ? pend : rawEnd,
-          );
-        }
-        if (partialInSession > sessionTotal) partialInSession = sessionTotal;
-
-        final pause = (sessionTotal - partialInSession).inMinutes;
-        final timer = timerById[session.timerId];
-        if (timer == null) continue;
-
-        lines.add(ReportLine(
-          timer: timer,
-          totalSessionId: session.id,
-          start: session.startAt,
-          end: rawEnd,
-          partial: partialInSession,
-          total: sessionTotal,
-          pauseMinutes: pause,
-        ));
-      }
-    }
-
-    // Apply timer-level corrections so reports stay in sync with edit values.
-    final byTimer = <int, List<int>>{};
-    for (var i = 0; i < lines.length; i++) {
-      byTimer.putIfAbsent(lines[i].timer.id, () => []).add(i);
-    }
-
-    for (final t in timers) {
-      final idxs = byTimer[t.id] ?? const <int>[];
-      if (idxs.isEmpty) continue;
-      var line = lines[idxs.first];
-
-      if (t.partialAdjustSec != 0) {
-        var newPartial = line.partial + Duration(seconds: t.partialAdjustSec);
-        if (newPartial.isNegative) newPartial = Duration.zero;
-        final newPause = (line.total - newPartial).inMinutes < 0 ? 0 : (line.total - newPartial).inMinutes;
-        line = line.copyWith(partial: newPartial, pauseMinutes: newPause);
-      }
-
-      if (t.totalAdjustSec != 0) {
-        var newTotal = line.total + Duration(seconds: t.totalAdjustSec);
-        if (newTotal.isNegative) newTotal = Duration.zero;
-        final newPause = (newTotal - line.partial).inMinutes < 0 ? 0 : (newTotal - line.partial).inMinutes;
-        line = line.copyWith(total: newTotal, pauseMinutes: newPause);
-      }
-
-      lines[idxs.first] = line;
-    }
-
-    lines.sort((a, b) => a.start.compareTo(b.start));
-    return lines;
+    return buildReportLines(rangeStart, rangeEnd);
   }
 
-  DateTime _weekStart(DateTime d) => DateTime(d.year, d.month, d.day).subtract(Duration(days: d.weekday - 1));
+  Future<(List<ReportLine>, int)> _buildReportData() async {
+    return (await _buildReportLines(), await DB.getWeeklyTargetSec());
+  }
+
+  DateTime _weekStart(DateTime d) => weekStartOf(d);
 
   int _isoWeek(DateTime d) {
     final thursday = d.add(Duration(days: 4 - d.weekday));
@@ -1260,6 +1504,8 @@ class _ReportsScreenState extends State<ReportsScreen> {
     final pdf = pw.Document();
     final (rangeStart, rangeEnd) = _rangeNow();
     final totalPartial = lines.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
+    final targetSec = await DB.getWeeklyTargetSec();
+    final target = Duration(seconds: targetSec);
 
     final widgets = <pw.Widget>[
       pw.Text('Zeitanachweis', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
@@ -1299,6 +1545,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
         );
         widgets.add(pw.SizedBox(height: 4));
         widgets.add(pw.Text('Wochensumme: ${fmt(weekTotal)}'));
+        if (targetSec > 0) {
+          widgets.add(pw.Text('Plus-/Minusstunden (Soll ${fmt(target)}): ${fmtBalance(weekTotal - target)}'));
+        }
         widgets.add(pw.SizedBox(height: 12));
       }
     } else {
@@ -1323,6 +1572,14 @@ class _ReportsScreenState extends State<ReportsScreen> {
     }
 
     widgets.add(pw.Text('Monatssumme / Gesamt: ${fmt(totalPartial)}'));
+    if (targetSec > 0 && period != 'today') {
+      final balance = period == 'week'
+          ? totalPartial - target
+          : workedPerWeek(lines)
+              .values
+              .fold<Duration>(Duration.zero, (a, worked) => a + (worked - target));
+      widgets.add(pw.Text('Plus-/Minusstunden gesamt: ${fmtBalance(balance)}'));
+    }
     widgets.add(pw.SizedBox(height: 24));
     widgets.add(
       pw.Row(
@@ -1370,12 +1627,20 @@ class _ReportsScreenState extends State<ReportsScreen> {
           const SizedBox(width: 12),
         ],
       ),
-      body: FutureBuilder<List<ReportLine>>(
-        future: _buildReportLines(),
+      body: FutureBuilder<(List<ReportLine>, int)>(
+        future: _buildReportData(),
         builder: (context, snap) {
           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-          final lines = snap.data!;
+          final (lines, targetSec) = snap.data!;
+          final target = Duration(seconds: targetSec);
           final totalPartial = lines.fold<Duration>(Duration.zero, (a, b) => a + b.partial);
+          final Duration? balance = targetSec <= 0 || period == 'today'
+              ? null
+              : period == 'week'
+                  ? totalPartial - target
+                  : workedPerWeek(lines)
+                      .values
+                      .fold<Duration>(Duration.zero, (a, worked) => a + (worked - target));
 
           return ListView(
             padding: const EdgeInsets.all(12),
@@ -1413,6 +1678,17 @@ class _ReportsScreenState extends State<ReportsScreen> {
                       ],
                       const Text('Total partial time'),
                       Text(fmt(totalPartial)),
+                      if (balance != null) ...[
+                        const SizedBox(height: 4),
+                        Text('Soll pro Woche: ${fmt(target)}'),
+                        Text(
+                          '${balance.isNegative ? 'Minusstunden' : 'Plusstunden'}: ${fmtBalance(balance)}',
+                          style: TextStyle(
+                            color: balance.isNegative ? Colors.red : Colors.green,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 8),
                       Wrap(
                         spacing: 6,
