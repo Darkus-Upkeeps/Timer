@@ -149,12 +149,15 @@ class Notifications {
     );
   }
 
-  static Future<void> showPaused(WorkTimer t, Duration partialElapsed) async {
+  static Future<void> showPaused(WorkTimer t, Duration partialElapsed, {Duration? autoStopRemaining}) async {
     if (!_ready) return;
+    final body = autoStopRemaining == null
+        ? 'Paused • today ${fmt(partialElapsed)}'
+        : 'Paused • today ${fmt(partialElapsed)} • ${fmt(autoStopRemaining)} left before auto-stop';
     await _plugin.show(
       t.id,
       t.name,
-      'Paused • today ${fmt(partialElapsed)}',
+      body,
       NotificationDetails(android: _statusDetails(running: false)),
     );
   }
@@ -202,8 +205,9 @@ Future<void> syncTimerNotifications() async {
     // Clear any stale scheduled auto-stop before re-showing/re-scheduling.
     await Notifications.cancelTimer(t.id);
     final stats = await computeStats(t);
-    // Projected stop moment based on worked time; null while paused (the
-    // deadline moves with every pause, so it is rescheduled on resume).
+    // Projected stop moment based on the day's worked time; null while paused
+    // (a pause pushes the deadline back, so it is rescheduled on resume — the
+    // remaining budget itself is kept and shown in the paused notification).
     DateTime? deadline;
     final projectedMs = await DB.getAutoStopProjectionMs(t);
     if (projectedMs != null) {
@@ -212,7 +216,8 @@ Future<void> syncTimerNotifications() async {
     if (t.isPartialActive) {
       await Notifications.showRunning(t, stats.partialToday, autoStopAt: deadline);
     } else {
-      await Notifications.showPaused(t, stats.partialToday);
+      await Notifications.showPaused(t, stats.partialToday,
+          autoStopRemaining: stats.autoStopRemaining);
     }
     if (deadline != null) {
       await Notifications.scheduleAutoStop(t, deadline);
@@ -232,6 +237,12 @@ class WorkTimer {
   final int pieces;
   final int autoStopSec;
 
+  /// Wall-clock instant at which the auto-stop last fired for this timer, or 0
+  /// when it never did. Used to arm the limit once per work day: after it
+  /// fired, a session the user deliberately starts again on the same day is
+  /// left alone instead of being killed on the spot.
+  final int autoStopDoneMs;
+
   WorkTimer({
     required this.id,
     required this.name,
@@ -243,6 +254,7 @@ class WorkTimer {
     required this.createdAtMs,
     required this.pieces,
     required this.autoStopSec,
+    this.autoStopDoneMs = 0,
   });
 
   factory WorkTimer.fromMap(Map<String, Object?> m) => WorkTimer(
@@ -257,6 +269,7 @@ class WorkTimer {
         pieces:
 (m['pieces'] as int? ?? 0 ),
         autoStopSec: (m['auto_stop_sec'] as int? ?? 0),
+        autoStopDoneMs: (m['auto_stop_done_ms'] as int? ?? 0),
       );
 }
 
@@ -278,9 +291,33 @@ class Segment {
       );
 }
 
+/// Start of the calendar day [ms] falls into, in local time.
+int startOfDayMs(int ms) {
+  final d = DateTime.fromMillisecondsSinceEpoch(ms);
+  return DateTime(d.year, d.month, d.day).millisecondsSinceEpoch;
+}
+
+/// First instant of the work day an auto-stop limit is measured over.
+///
+/// Normally that is midnight of the current day, so every pause, stop and
+/// restart during the day draws from the same budget — the whole point of an
+/// "auto-stop after 7h" setting. A session that was opened on an earlier day
+/// (a night shift) keeps the window anchored on the day it started in, so
+/// midnight does not hand out a second budget mid-shift.
+int autoStopWindowStartMs({required int sessionStartMs, required int nowMs}) {
+  final today = startOfDayMs(nowMs);
+  final sessionDay = startOfDayMs(sessionStartMs);
+  return sessionDay < today ? sessionDay : today;
+}
+
 class DB {
   static Database? _db;
   static Future<Database>? _opening;
+
+  /// Clock behind the auto-stop bookkeeping. Overridable so tests can place
+  /// themselves inside a work day instead of waiting for one.
+  @visibleForTesting
+  static int Function() nowMs = () => DateTime.now().millisecondsSinceEpoch;
 
   /// Single-flight database handle. Several screens hit this concurrently on
   /// the first frame; without the [_opening] guard each of them would start
@@ -295,7 +332,7 @@ class DB {
     final dbPath = await getDatabasesPath();
     final db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 7,
+      version: 8,
       onConfigure: (db) async {
         // Must happen outside a transaction, which is why it lives here and
         // not in onCreate/onUpgrade. Without it the ON DELETE CASCADE
@@ -314,7 +351,8 @@ class DB {
             total_adjust_sec INTEGER NOT NULL DEFAULT 0,
             created_at_ms INTEGER NOT NULL,
             pieces INTEGER NOT NULL DEFAULT 0,
-            auto_stop_sec INTEGER NOT NULL DEFAULT 0
+            auto_stop_sec INTEGER NOT NULL DEFAULT 0,
+            auto_stop_done_ms INTEGER NOT NULL DEFAULT 0
           )
         ''');
         await db.execute('''
@@ -418,6 +456,10 @@ class DB {
             )
           ''');
         }
+
+        if (oldVersion < 8) {
+          await db.execute('ALTER TABLE timers ADD COLUMN auto_stop_done_ms INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+        }
       },
     );
     _db = db;
@@ -440,15 +482,19 @@ class DB {
     return timers;
   }
 
-  /// Closes sessions of active timers once the *worked* time (partial
-  /// segments, i.e. excluding pauses) reaches the auto-stop limit. The
-  /// session ends exactly at the instant the limit was reached (not "now"),
-  /// so recorded time stays correct even when the app was closed meanwhile.
-  /// Returns (timerId, stoppedAtMs) for every timer that was stopped.
+  /// Closes sessions of active timers once the *worked* time of the current
+  /// work day (partial segments, i.e. excluding pauses) reaches the auto-stop
+  /// limit. The budget belongs to the day, not to a single session: pausing
+  /// over lunch, or stopping and starting the timer again, carries the
+  /// already-worked time along instead of handing out a fresh limit.
+  /// The session ends exactly at the instant the limit was reached (not
+  /// "now"), so recorded time stays correct even when the app was closed
+  /// meanwhile. Returns (timerId, stoppedAtMs) for every timer that stopped.
   static Future<List<(int, int)>> _enforceAutoStops(Database db) async {
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = nowMs();
     final rows = await db.rawQuery('''
       SELECT t.id AS timer_id, t.auto_stop_sec AS auto_stop_sec,
+             t.auto_stop_done_ms AS auto_stop_done_ms,
              s.id AS session_id, s.start_at_ms AS start_at_ms
       FROM timers t
       JOIN total_sessions s ON s.timer_id = t.id AND s.end_at_ms IS NULL
@@ -459,19 +505,40 @@ class DB {
     for (final r in rows) {
       final timerId = r['timer_id'] as int;
       final limitMs = (r['auto_stop_sec'] as int) * 1000;
-      final (_, reachedAt) = await _sessionWorkedMs(db, timerId, r['start_at_ms'] as int, now, limitMs: limitMs);
+      final sessionStart = r['start_at_ms'] as int;
+      final windowStart = autoStopWindowStartMs(sessionStartMs: sessionStart, nowMs: now);
+      // The limit fires once per work day. A session started after it already
+      // fired is the user's deliberate overtime and stays untouched.
+      if ((r['auto_stop_done_ms'] as int? ?? 0) >= windowStart) continue;
+      final (_, reachedAt) = await _workedSinceMs(db, timerId, windowStart, now, limitMs: limitMs);
       if (reachedAt == null) continue;
-      await db.update('timers', {'is_total_active': 0, 'is_partial_active': 0}, where: 'id = ?', whereArgs: [timerId]);
+      if (reachedAt <= sessionStart) {
+        // The day's budget was already spent before this session was opened,
+        // so there is nothing of this session to cut off. Arm the limit for
+        // the next day and leave the running session alone rather than
+        // deleting time the user knowingly worked.
+        await db.update('timers', {'auto_stop_done_ms': now}, where: 'id = ?', whereArgs: [timerId]);
+        continue;
+      }
+      await db.update(
+        'timers',
+        {'is_total_active': 0, 'is_partial_active': 0, 'auto_stop_done_ms': reachedAt},
+        where: 'id = ?',
+        whereArgs: [timerId],
+      );
       await db.update('total_sessions', {'end_at_ms': reachedAt}, where: 'id = ?', whereArgs: [r['session_id']]);
       // Trim every segment that extends past the limit, not just those
       // starting before it. An open segment that started later would
       // otherwise stay open forever on a timer that is no longer active and
       // keep counting up to "now"; a closed one would record worked time past
       // the point where the session already ended. MAX() collapses a segment
-      // that begins after the limit to zero length.
+      // that begins after the limit to zero length. The comparison has to
+      // include equality, or a segment still open at the very moment the
+      // limit is reached (worked time hitting the limit exactly now) would be
+      // left open on a stopped timer.
       await db.rawUpdate(
         'UPDATE partial_segments SET end_at_ms = MAX(start_at_ms, ?) '
-        'WHERE timer_id = ? AND COALESCE(end_at_ms, ?) > ?',
+        'WHERE timer_id = ? AND COALESCE(end_at_ms, ?) >= ?',
         [reachedAt, timerId, now, reachedAt],
       );
       stopped.add((timerId, reachedAt));
@@ -479,14 +546,16 @@ class DB {
     return stopped;
   }
 
-  /// Sums the worked time (partial segments, pauses excluded) of the open
-  /// session starting at [sessionStartMs], with open segments counted up to
-  /// [nowMs]. When [limitMs] is given, also returns the exact instant the
-  /// accumulated worked time reached that limit (null if not reached).
-  static Future<(int, int?)> _sessionWorkedMs(
+  /// Sums the worked time (partial segments, pauses excluded) of a timer from
+  /// [windowStartMs] onwards, with open segments counted up to [nowMs]. All
+  /// segments in the window count, no matter which session they belong to, so
+  /// stopping and starting the timer again does not reset the tally.
+  /// When [limitMs] is given, also returns the exact instant the accumulated
+  /// worked time reached that limit (null if not reached).
+  static Future<(int, int?)> _workedSinceMs(
     DatabaseExecutor db,
     int timerId,
-    int sessionStartMs,
+    int windowStartMs,
     int nowMs, {
     int? limitMs,
   }) async {
@@ -494,14 +563,14 @@ class DB {
       'partial_segments',
       columns: ['start_at_ms', 'end_at_ms'],
       where: 'timer_id = ? AND COALESCE(end_at_ms, ?) > ?',
-      whereArgs: [timerId, nowMs, sessionStartMs],
+      whereArgs: [timerId, nowMs, windowStartMs],
       orderBy: 'start_at_ms ASC',
     );
     var worked = 0;
     int? reachedAt;
     for (final s in segs) {
       var start = s['start_at_ms'] as int;
-      if (start < sessionStartMs) start = sessionStartMs;
+      if (start < windowStartMs) start = windowStartMs;
       final end = (s['end_at_ms'] as int?) ?? nowMs;
       if (end <= start) continue;
       if (limitMs != null && reachedAt == null && worked + (end - start) >= limitMs) {
@@ -512,19 +581,32 @@ class DB {
     return (worked, reachedAt);
   }
 
-  /// Projected wall-clock instant at which a running timer will hit its
-  /// worked-time auto-stop limit. Null when there is no limit, no open
-  /// session, or the timer is paused (a paused timer accumulates no worked
-  /// time, so it has no fixed deadline).
-  static Future<int?> getAutoStopProjectionMs(WorkTimer t) async {
-    if (t.autoStopSec <= 0 || !t.isTotalActive || !t.isPartialActive) return null;
+  /// Worked time left before a timer hits its auto-stop limit, counted over
+  /// the whole work day (see [autoStopWindowStartMs]) rather than the current
+  /// session. Null when there is no limit, no open session, or the limit
+  /// already fired for this day.
+  static Future<Duration?> getAutoStopRemaining(WorkTimer t) async {
+    if (t.autoStopSec <= 0 || !t.isTotalActive) return null;
     final db = await database;
     final startMs = await getOpenTotalSessionStartMs(t.id);
     if (startMs == null) return null;
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final (worked, _) = await _sessionWorkedMs(db, t.id, startMs, now);
+    final now = nowMs();
+    final windowStart = autoStopWindowStartMs(sessionStartMs: startMs, nowMs: now);
+    if (t.autoStopDoneMs >= windowStart) return null;
+    final (worked, _) = await _workedSinceMs(db, t.id, windowStart, now);
     final remaining = t.autoStopSec * 1000 - worked;
-    return remaining <= 0 ? now : now + remaining;
+    return Duration(milliseconds: remaining <= 0 ? 0 : remaining);
+  }
+
+  /// Projected wall-clock instant at which a running timer will hit its
+  /// worked-time auto-stop limit. Null when the timer has no live limit or is
+  /// paused (a paused timer accumulates no worked time, so it has no fixed
+  /// deadline until it resumes).
+  static Future<int?> getAutoStopProjectionMs(WorkTimer t) async {
+    if (!t.isPartialActive) return null;
+    final remaining = await getAutoStopRemaining(t);
+    if (remaining == null) return null;
+    return nowMs() + remaining.inMilliseconds;
   }
 
   static Future<int?> getOpenTotalSessionStartMs(int timerId) async {
@@ -553,6 +635,7 @@ class DB {
       'created_at_ms': DateTime.now().millisecondsSinceEpoch,
       'pieces': 0,
       'auto_stop_sec': autoStopSec,
+      'auto_stop_done_ms': 0,
     });
   }
 
@@ -573,7 +656,15 @@ class DB {
       if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
       if (pieces != null)
 values['pieces'] = pieces;
-      if (autoStopSec != null) values['auto_stop_sec'] = autoStopSec;
+      if (autoStopSec != null) {
+        values['auto_stop_sec'] = autoStopSec;
+        final row = await txn.query('timers',
+            columns: ['auto_stop_sec'], where: 'id = ?', whereArgs: [id], limit: 1);
+        final oldAutoStopSec = row.isEmpty ? null : row.first['auto_stop_sec'] as int?;
+        // A changed limit is a new decision: arm it again even if today's
+        // auto-stop already fired.
+        if (oldAutoStopSec != autoStopSec) values['auto_stop_done_ms'] = 0;
+      }
       if (createdAtMs != null) {
         // Shift recorded time only by how much the created date actually
         // changed. Anchoring on the first session start instead moved all
@@ -832,7 +923,16 @@ class TimerStats {
   final Duration partialToday;
   final Duration totalAllTime;
 
-  const TimerStats({required this.partialToday, required this.totalAllTime});
+  /// Worked time left before the auto-stop limit closes the running session,
+  /// or null when the timer has no limit armed right now (no limit set, not
+  /// running, or the limit already fired for this work day).
+  final Duration? autoStopRemaining;
+
+  const TimerStats({
+    required this.partialToday,
+    required this.totalAllTime,
+    this.autoStopRemaining,
+  });
 }
 
 Future<TimerStats> computeStats(WorkTimer timer) async {
@@ -862,7 +962,33 @@ Future<TimerStats> computeStats(WorkTimer timer) async {
   if (partialToday.isNegative) partialToday = Duration.zero;
   if (totalAllTime.isNegative) totalAllTime = Duration.zero;
 
-  return TimerStats(partialToday: partialToday, totalAllTime: totalAllTime);
+  return TimerStats(
+    partialToday: partialToday,
+    totalAllTime: totalAllTime,
+    autoStopRemaining: await DB.getAutoStopRemaining(timer),
+  );
+}
+
+/// Dashboard line for an active timer: its state plus how much of today's
+/// auto-stop budget is left, when a limit is armed.
+String _dashboardSubtitle(WorkTimer t, TimerStats? stats) {
+  final state = t.isPartialActive ? 'Running' : 'Paused';
+  final remaining = stats?.autoStopRemaining;
+  if (remaining == null) return state;
+  return '$state • ${fmt(remaining)} left before auto-stop';
+}
+
+/// Card line describing the auto-stop limit and what is left of today's
+/// budget. The limit covers the whole work day, so pausing over lunch or
+/// stopping and starting again keeps counting down the same budget.
+String _autoStopLine(WorkTimer t, TimerStats? stats) {
+  final limit = 'Auto-stop after ${fmt(Duration(seconds: t.autoStopSec))} worked time per day';
+  // While the stats are still loading there is nothing to say about the
+  // budget yet — saying "already reached" for that frame would be a lie.
+  if (!t.isTotalActive || stats == null) return limit;
+  final remaining = stats.autoStopRemaining;
+  if (remaining == null) return '$limit • already reached today';
+  return '$limit • ${fmt(remaining)} left today';
 }
 
 class TimersScreen extends StatefulWidget {
@@ -996,7 +1122,7 @@ class _TimersScreenState extends State<TimersScreen> {
                   controller: autoStopCtrl,
                   keyboardType: const TextInputType.numberWithOptions(decimal: true),
                   decoration: InputDecoration(
-                    labelText: 'Auto-stop after worked time (hours: 8, 7.5 or 08:30 — empty = off)',
+                    labelText: 'Auto-stop after worked time per day (hours: 8, 7.5 or 08:30 — empty = off)',
                     suffixIcon: IconButton(onPressed: () => pickCorrection(autoStopCtrl), icon: const Icon(Icons.timer_off)),
                   ),
                 ),
@@ -1167,7 +1293,8 @@ class _TimersScreenState extends State<TimersScreen> {
                           Text('Partial (today): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
 Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
-                          if (t.autoStopSec > 0) Text('Auto-stop after ${fmt(Duration(seconds: t.autoStopSec))} worked time'),
+                          if (t.autoStopSec > 0)
+                            Text(_autoStopLine(t, statsSnap.data)),
 
                           const SizedBox(height: 10),
                           Wrap(
@@ -1499,7 +1626,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   child: ListTile(
                     leading: Icon(Icons.circle, size: 14, color: t.isPartialActive ? Colors.green : Colors.orange),
                     title: Text('${t.name} • ${t.product}'),
-                    subtitle: Text(t.isPartialActive ? 'Running' : 'Paused'),
+                    subtitle: Text(_dashboardSubtitle(t, data.activeStats[t.id])),
                     trailing: Text(
                       fmt(data.activeStats[t.id]?.partialToday ?? Duration.zero),
                       style: Theme.of(context).textTheme.titleMedium,
