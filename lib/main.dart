@@ -149,11 +149,12 @@ class Notifications {
     );
   }
 
-  static Future<void> showPaused(WorkTimer t, Duration partialElapsed, {Duration? autoStopRemaining}) async {
+  static Future<void> showPaused(WorkTimer t, Duration partialElapsed,
+      {Duration? autoStopRemaining, String dayLabel = 'today'}) async {
     if (!_ready) return;
     final body = autoStopRemaining == null
-        ? 'Paused • today ${fmt(partialElapsed)}'
-        : 'Paused • today ${fmt(partialElapsed)} • ${fmt(autoStopRemaining)} left before auto-stop';
+        ? 'Paused • $dayLabel ${fmt(partialElapsed)}'
+        : 'Paused • $dayLabel ${fmt(partialElapsed)} • ${fmt(autoStopRemaining)} left before auto-stop';
     await _plugin.show(
       t.id,
       t.name,
@@ -217,7 +218,7 @@ Future<void> syncTimerNotifications() async {
       await Notifications.showRunning(t, stats.partialToday, autoStopAt: deadline);
     } else {
       await Notifications.showPaused(t, stats.partialToday,
-          autoStopRemaining: stats.autoStopRemaining);
+          autoStopRemaining: stats.autoStopRemaining, dayLabel: partialLabel(stats));
     }
     if (deadline != null) {
       await Notifications.scheduleAutoStop(t, deadline);
@@ -237,6 +238,12 @@ class WorkTimer {
   final int pieces;
   final int autoStopSec;
 
+  /// Wall-clock instant the partial correction was entered for, or 0 when
+  /// there is no correction. A correction fixes up one day's record, so the
+  /// timer card applies it to that day only instead of to every day that
+  /// follows.
+  final int partialAdjustAtMs;
+
   /// Wall-clock instant at which the auto-stop last fired for this timer, or 0
   /// when it never did. Used to arm the limit once per work day: after it
   /// fired, a session the user deliberately starts again on the same day is
@@ -254,6 +261,7 @@ class WorkTimer {
     required this.createdAtMs,
     required this.pieces,
     required this.autoStopSec,
+    this.partialAdjustAtMs = 0,
     this.autoStopDoneMs = 0,
   });
 
@@ -269,6 +277,7 @@ class WorkTimer {
         pieces:
 (m['pieces'] as int? ?? 0 ),
         autoStopSec: (m['auto_stop_sec'] as int? ?? 0),
+        partialAdjustAtMs: (m['partial_adjust_at_ms'] as int? ?? 0),
         autoStopDoneMs: (m['auto_stop_done_ms'] as int? ?? 0),
       );
 }
@@ -332,7 +341,7 @@ class DB {
     final dbPath = await getDatabasesPath();
     final db = await openDatabase(
       p.join(dbPath, 'work_timer.db'),
-      version: 8,
+      version: 9,
       onConfigure: (db) async {
         // Must happen outside a transaction, which is why it lives here and
         // not in onCreate/onUpgrade. Without it the ON DELETE CASCADE
@@ -352,7 +361,8 @@ class DB {
             created_at_ms INTEGER NOT NULL,
             pieces INTEGER NOT NULL DEFAULT 0,
             auto_stop_sec INTEGER NOT NULL DEFAULT 0,
-            auto_stop_done_ms INTEGER NOT NULL DEFAULT 0
+            auto_stop_done_ms INTEGER NOT NULL DEFAULT 0,
+            partial_adjust_at_ms INTEGER NOT NULL DEFAULT 0
           )
         ''');
         await db.execute('''
@@ -459,6 +469,20 @@ class DB {
 
         if (oldVersion < 8) {
           await db.execute('ALTER TABLE timers ADD COLUMN auto_stop_done_ms INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+        }
+
+        if (oldVersion < 9) {
+          await db.execute('ALTER TABLE timers ADD COLUMN partial_adjust_at_ms INTEGER NOT NULL DEFAULT 0').catchError((_) {});
+          // Corrections entered before this version carry no date. Pin them to
+          // the timer's last recorded work, which is the day they were meant
+          // to fix, so they stop being re-applied to every following day.
+          await db.rawUpdate('''
+            UPDATE timers SET partial_adjust_at_ms = COALESCE(
+              (SELECT MAX(COALESCE(end_at_ms, start_at_ms)) FROM partial_segments
+                WHERE partial_segments.timer_id = timers.id),
+              created_at_ms)
+            WHERE partial_adjust_sec != 0
+          ''');
         }
       },
     );
@@ -636,6 +660,7 @@ class DB {
       'pieces': 0,
       'auto_stop_sec': autoStopSec,
       'auto_stop_done_ms': 0,
+      'partial_adjust_at_ms': 0,
     });
   }
 
@@ -652,7 +677,17 @@ class DB {
     final db = await database;
     await db.transaction((txn) async {
       final values = <String, Object?>{'name': name.trim(), 'product': product.trim()};
-      if (partialAdjustSec != null) values['partial_adjust_sec'] = partialAdjustSec;
+      if (partialAdjustSec != null) {
+        values['partial_adjust_sec'] = partialAdjustSec;
+        final row = await txn.query('timers',
+            columns: ['partial_adjust_sec'], where: 'id = ?', whereArgs: [id], limit: 1);
+        final oldAdjust = row.isEmpty ? null : row.first['partial_adjust_sec'] as int?;
+        // Date the correction when it actually changes, so re-saving the
+        // dialog for an unrelated field does not move it to another day.
+        if (oldAdjust != partialAdjustSec) {
+          values['partial_adjust_at_ms'] = partialAdjustSec == 0 ? 0 : nowMs();
+        }
+      }
       if (totalAdjustSec != null) values['total_adjust_sec'] = totalAdjustSec;
       if (pieces != null)
 values['pieces'] = pieces;
@@ -923,6 +958,12 @@ class TimerStats {
   final Duration partialToday;
   final Duration totalAllTime;
 
+  /// Day the [partialToday] figure belongs to. Normally the current work day;
+  /// when nothing was worked in it, the last day that has recorded time, so a
+  /// timer that ran yesterday keeps showing yesterday's hours instead of a
+  /// bare 0:00:00 while the reports still list them.
+  final DateTime partialDay;
+
   /// Worked time left before the auto-stop limit closes the running session,
   /// or null when the timer has no limit armed right now (no limit set, not
   /// running, or the limit already fired for this work day).
@@ -931,6 +972,7 @@ class TimerStats {
   const TimerStats({
     required this.partialToday,
     required this.totalAllTime,
+    required this.partialDay,
     this.autoStopRemaining,
   });
 }
@@ -938,41 +980,89 @@ class TimerStats {
 Future<TimerStats> computeStats(WorkTimer timer) async {
   final partialSegs = await DB.getPartialSegmentsForTimer(timer.id);
   final totalSegs = await DB.getTotalSessionsForTimer(timer.id);
-  final now = DateTime.now();
-  final dayStart = DateTime(now.year, now.month, now.day);
+  final now = DateTime.fromMillisecondsSinceEpoch(DB.nowMs());
+  final openSessionStartMs = await DB.getOpenTotalSessionStartMs(timer.id);
+  // Same work day the auto-stop budget uses: midnight, unless a session that
+  // began on an earlier day is still open (night shift), in which case the day
+  // it started in. Otherwise midnight would cut a running shift in half.
+  final dayStart = DateTime.fromMillisecondsSinceEpoch(openSessionStartMs == null
+      ? startOfDayMs(now.millisecondsSinceEpoch)
+      : autoStopWindowStartMs(sessionStartMs: openSessionStartMs, nowMs: now.millisecondsSinceEpoch));
 
-  Duration partialToday = Duration.zero;
-  Duration totalAllTime = Duration.zero;
-
-
-
-  for (final s in partialSegs) {
-    final end = s.endAt ?? now;
-    if (!end.isAfter(s.startAt)) continue;
-    partialToday += overlapDuration(rangeStart: dayStart, rangeEnd: now, segStart: s.startAt, segEnd: end);
+  Duration workedBetween(DateTime from, DateTime to) {
+    var sum = Duration.zero;
+    for (final s in partialSegs) {
+      final end = s.endAt ?? now;
+      if (!end.isAfter(s.startAt)) continue;
+      sum += overlapDuration(rangeStart: from, rangeEnd: to, segStart: s.startAt, segEnd: end);
+    }
+    return sum;
   }
+
+  var partialDay = dayStart;
+  var partialToday = workedBetween(dayStart, now);
+
+  if (partialToday == Duration.zero && !timer.isPartialActive) {
+    // Nothing worked in the current day. Fall back to the last day that has
+    // recorded time instead of showing 0:00:00 for work the reports still
+    // list; the card names the day it is showing.
+    DateTime? lastEnd;
+    for (final s in partialSegs) {
+      final end = s.endAt ?? now;
+      if (!end.isAfter(s.startAt)) continue;
+      if (lastEnd == null || end.isAfter(lastEnd)) lastEnd = end;
+    }
+    if (lastEnd != null && lastEnd.isBefore(dayStart)) {
+      partialDay = DateTime(lastEnd.year, lastEnd.month, lastEnd.day);
+      partialToday = workedBetween(partialDay, partialDay.add(const Duration(days: 1)));
+    }
+  }
+
+  // A correction fixes up the day it was entered for. Applying it to every
+  // later day too would inflate them, or — for a correction that subtracts
+  // time — pin them at 0:00:00 forever.
+  if (timer.partialAdjustSec != 0 &&
+      startOfDayMs(timer.partialAdjustAtMs) == partialDay.millisecondsSinceEpoch) {
+    partialToday += Duration(seconds: timer.partialAdjustSec);
+  }
+
+  Duration totalAllTime = Duration.zero;
   for (final s in totalSegs) {
     final end = s.endAt ?? now;
     if (!end.isAfter(s.startAt)) continue;
     totalAllTime += end.difference(s.startAt);
   }
-
-  partialToday += Duration(seconds: timer.partialAdjustSec);
   totalAllTime += Duration(seconds: timer.totalAdjustSec);
+
   if (partialToday.isNegative) partialToday = Duration.zero;
   if (totalAllTime.isNegative) totalAllTime = Duration.zero;
 
   return TimerStats(
     partialToday: partialToday,
     totalAllTime: totalAllTime,
+    partialDay: partialDay,
     autoStopRemaining: await DB.getAutoStopRemaining(timer),
   );
+}
+
+/// Label for the timer card's partial line: 'today' for the current work day,
+/// the date itself for an older one that is being shown because nothing was
+/// worked today.
+String partialLabel(TimerStats? stats) {
+  if (stats == null) return 'today';
+  final today = startOfDayMs(DB.nowMs());
+  if (stats.partialDay.millisecondsSinceEpoch >= today) return 'today';
+  final d = stats.partialDay;
+  return '${d.day.toString().padLeft(2, '0')}.${d.month.toString().padLeft(2, '0')}.';
 }
 
 /// Dashboard line for an active timer: its state plus how much of today's
 /// auto-stop budget is left, when a limit is armed.
 String _dashboardSubtitle(WorkTimer t, TimerStats? stats) {
-  final state = t.isPartialActive ? 'Running' : 'Paused';
+  final label = partialLabel(stats);
+  // Only worth naming when it is not the current day — that is when the
+  // figure beside it would otherwise look like time worked today.
+  final state = (t.isPartialActive ? 'Running' : 'Paused') + (label == 'today' ? '' : ' • $label');
   final remaining = stats?.autoStopRemaining;
   if (remaining == null) return state;
   return '$state • ${fmt(remaining)} left before auto-stop';
@@ -1290,7 +1380,7 @@ class _TimersScreenState extends State<TimersScreen> {
                           Text('Product: ${t.product}'),
                           Text('Created: ${fmtDateTime(DateTime.fromMillisecondsSinceEpoch(t.createdAtMs))}'),
                           const SizedBox(height: 8),
-                          Text('Partial (today): ${fmt(partial)}'),
+                          Text('Partial (${partialLabel(statsSnap.data)}): ${fmt(partial)}'),
                           Text('Total (all-time): ${fmt(total)}'),
 Text('Stücke: ${t.pieces} | Schnitt: $avgText'),
                           if (t.autoStopSec > 0)

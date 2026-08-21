@@ -25,3 +25,17 @@ A timer can stop itself after a given amount of **worked** time. The limit is a
 The remaining budget is shown on the timer card, on the dashboard and in the
 status-bar notification, and the running notification names the projected
 stop time.
+
+## Partial time on the timer card
+
+"Partial" is the worked time (pauses excluded) of a work day:
+
+- It follows the same work day as the auto-stop budget, so a shift that
+  started the previous evening keeps counting past midnight instead of being
+  cut in half.
+- When nothing was worked in the current day, the card keeps showing the last
+  day that has recorded time and names it (`Partial (19.08.)`), rather than
+  dropping to 0:00:00 for work the reports still list.
+- A partial correction belongs to the day it was entered for. It is applied to
+  that day only — a correction that subtracts time no longer subtracts it again
+  from every following day.
